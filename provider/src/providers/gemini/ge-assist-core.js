@@ -1,0 +1,175 @@
+/**
+ * Gemini Enterprise via Discovery Engine API（assistants/default_assistant:streamAssist）。
+ *
+ * streamAssist 是 GE 助手接口，只接受一段 query.text，没有 systemInstruction / contents 历史 /
+ * generationConfig / JSON Schema，也不返回 token 用量。本提供方把 Gemini 请求压平成一段文字：
+ *   【系统指令】… 【用户】… 【助手】… （历史）… 最后一条用户消息
+ * 请求了 JSON（responseMimeType=application/json）时，在末尾加格式要求，并去掉回答外层的 ```json 代码块。
+ *
+ * 模型：generationSpec.modelId，不带档位后缀（客户端传 -low/-medium/-high 会被去掉）。
+ * 认证：Google ADC（GCE/Cloud Run 服务账号，或 GE_CREDENTIALS_FILE）。
+ */
+import axios from 'axios';
+import { StringDecoder } from 'string_decoder';
+import { GoogleAuth } from 'google-auth-library';
+import logger from '../../utils/logger.js';
+import { getProviderModels } from '../provider-models.js';
+import { MODEL_PROVIDER } from '../../utils/common.js';
+
+const BASE = 'https://discoveryengine.googleapis.com/v1alpha';
+const ROLE = { user: '用户', model: '助手', assistant: '助手' };
+
+function partsText(parts) {
+    return (parts || []).filter(p => typeof p?.text === 'string' && !p.thought).map(p => p.text).join('');
+}
+
+function stripFence(t) {
+    const m = String(t).trim().match(/^```(?:json)?\s*([\s\S]*?)\s*```$/i);
+    return m ? m[1] : t;
+}
+
+/** 增量解析 streamAssist 返回的 JSON 数组 `[{...},{...}]`，每凑齐一个元素就产出 */
+async function* iterJsonArray(stream) {
+    let depth = 0, inStr = false, esc = false, buf = '';
+    const dec = new StringDecoder('utf8');     // 网络分块可能切断多字节汉字，必须用 StringDecoder
+    for await (const chunk of stream) {
+        for (const ch of dec.write(chunk)) {
+            if (depth === 0) { if (ch === '[') depth = 1; continue; }
+            if (depth === 1 && ch !== '{') { if (ch === ']') depth = 0; continue; }
+            buf += ch;
+            if (inStr) { if (esc) esc = false; else if (ch === '\\') esc = true; else if (ch === '"') inStr = false; continue; }
+            if (ch === '"') inStr = true;
+            else if (ch === '{') depth++;
+            else if (ch === '}') { depth--; if (depth === 1) { yield JSON.parse(buf); buf = ''; } }
+        }
+    }
+}
+
+export class GeAssistApiService {
+    constructor(config) {
+        this.config = config;
+        this.projectId = config.GE_PROJECT_ID || process.env.GE_PROJECT_ID;
+        this.engineId = config.GE_ENGINE_ID || process.env.GE_ENGINE_ID;
+        if (!this.projectId || !this.engineId) throw new Error('GE_PROJECT_ID and GE_ENGINE_ID are required for gemini-ge-assist');
+        this.location = config.GE_LOCATION || 'global';
+        this.webGrounding = config.GE_WEB_GROUNDING === true;
+        this.timeout = config.GE_TIMEOUT_MS || 600000;
+        const authOpts = { scopes: ['https://www.googleapis.com/auth/cloud-platform'] };
+        if (config.GE_CREDENTIALS_FILE) authOpts.keyFile = config.GE_CREDENTIALS_FILE;
+        this.auth = new GoogleAuth(authOpts);
+        this.url = `${BASE}/projects/${this.projectId}/locations/${this.location}/collections/default_collection/engines/${this.engineId}/assistants/default_assistant:streamAssist`;
+        this.isInitialized = false;
+    }
+
+    async initialize() {
+        await this._token();
+        this.isInitialized = true;
+        logger.info(`[GE Assist] project=${this.projectId} engine=${this.engineId} webGrounding=${this.webGrounding}`);
+    }
+
+    async _token() {
+        const { token } = await (await this.auth.getClient()).getAccessToken();
+        if (!token) throw new Error('[GE Assist] failed to obtain access token');
+        return token;
+    }
+
+    modelId(model) {
+        return String(model || '').replace(/^models\//, '').replace(/-(low|medium|high)$/, '');
+    }
+
+    isJson(req) {
+        const gc = req?.generationConfig || req?.generation_config || {};
+        return gc.responseMimeType === 'application/json' || gc.response_mime_type === 'application/json';
+    }
+
+    /** 把 Gemini 请求压平成 query.text */
+    buildQueryText(req) {
+        const sys = req?.systemInstruction || req?.system_instruction;
+        const contents = req?.contents || [];
+        const out = [];
+        const sysText = sys ? partsText(sys.parts) : '';
+        if (sysText) out.push(`【系统指令】\n${sysText}`);
+        contents.forEach((c, i) => {
+            const t = partsText(c.parts);
+            if (!t) return;
+            const last = i === contents.length - 1 && (c.role || 'user') === 'user';
+            out.push(contents.length === 1 && !sysText ? t : `【${last ? '本次用户消息' : (ROLE[c.role] || '用户')}】\n${t}`);
+        });
+        if (this.isJson(req)) {
+            const gc = req.generationConfig || req.generation_config;
+            const schema = gc.responseJsonSchema || gc.responseSchema || gc.response_json_schema || gc.response_schema;
+            out.push('只输出一个 JSON 对象，不要用 Markdown 代码块包裹，不要输出 JSON 以外的任何文字。'
+                + (schema ? `JSON 必须符合以下 JSON Schema：\n${JSON.stringify(schema)}` : ''));
+        }
+        return out.join('\n\n');
+    }
+
+    async _open(model, req) {
+        const body = {
+            query: { text: this.buildQueryText(req) },
+            generationSpec: { modelId: this.modelId(model) },
+            toolsSpec: this.webGrounding ? { webGroundingSpec: {} } : {},   // {} = 不联网
+        };
+        logger.info(`[GE Assist] model=${model} -> modelId=${body.generationSpec.modelId} queryChars=${body.query.text.length} json=${this.isJson(req)}`);
+        try {
+            return await axios.post(this.url, body, {
+                headers: { Authorization: `Bearer ${await this._token()}`, 'X-Goog-User-Project': this.projectId, 'Content-Type': 'application/json' },
+                timeout: this.timeout, responseType: 'stream',
+            });
+        } catch (error) {
+            if (error.response?.data) {
+                let s = ''; for await (const c of error.response.data) s += c.toString('utf8');
+                error.message = `[GE Assist] HTTP ${error.response.status}: ${s.slice(0, 800)}`;
+            }
+            logger.error(error.message);
+            throw error;
+        }
+    }
+
+    /** streamAssist 元素 → Gemini 响应块（只取文本；思考摘要作为 thought part） */
+    *_toGemini(el) {
+        if (el.error) throw new Error(`[GE Assist] ${JSON.stringify(el.error)}`);
+        const ans = el.answer || {};
+        if (ans.state === 'FAILED' || ans.state === 'SKIPPED') throw new Error(`[GE Assist] answer ${ans.state}: ${JSON.stringify(ans.assistSkippedReasons || [])}`);
+        for (const r of ans.replies || []) {
+            const c = r.groundedContent?.content || {};
+            if (typeof c.text !== 'string' || c.mimeType) continue;          // 跳过推荐问题等非文本
+            yield { candidates: [{ index: 0, content: { role: 'model', parts: [c.thought ? { text: c.text, thought: true } : { text: c.text }] } }] };
+        }
+    }
+
+    async generateContent(model, req) {
+        const r = await this._open(model, req);
+        let text = '', thoughts = '', session;
+        for await (const el of iterJsonArray(r.data)) {
+            session = el.sessionInfo?.session || session;
+            for (const g of this._toGemini(el)) {
+                const p = g.candidates[0].content.parts[0];
+                if (p.thought) thoughts += p.text; else text += p.text;
+            }
+        }
+        text = text.replace(/\s+$/, '');      // streamAssist 回答末尾固定带 \n\n
+        if (this.isJson(req)) text = stripFence(text);
+        const parts = []; if (thoughts) parts.push({ text: thoughts, thought: true }); parts.push({ text });
+        return { candidates: [{ index: 0, finishReason: 'STOP', content: { role: 'model', parts } }], modelVersion: this.modelId(model), geAssistSession: session };
+    }
+
+    async *generateContentStream(model, req) {
+        if (this.isJson(req)) {           // JSON 需要整体去掉代码块，只能整段返回
+            yield await this.generateContent(model, req);
+            return;
+        }
+        const r = await this._open(model, req);
+        for await (const el of iterJsonArray(r.data)) yield* this._toGemini(el);
+        yield { candidates: [{ index: 0, finishReason: 'STOP', content: { role: 'model', parts: [{ text: '' }] } }], modelVersion: this.modelId(model) };
+    }
+
+    async listModels() {
+        return { models: getProviderModels(MODEL_PROVIDER.GE_ASSIST).map(id => ({
+            name: `models/${id}`, version: '1.0.0', displayName: id, description: `Gemini Enterprise streamAssist ${id}`,
+            inputTokenLimit: 1048576, outputTokenLimit: 65536, supportedGenerationMethods: ['generateContent', 'streamGenerateContent'],
+        })) };
+    }
+
+    isExpiryDateNear() { return false; }
+}

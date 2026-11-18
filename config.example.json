@@ -1,0 +1,11 @@
+{
+  "REQUIRED_API_KEY": "<API_KEY>",
+  "SERVER_PORT": 3000,
+  "HOST": "0.0.0.0",
+  "MODEL_PROVIDER": "gemini-ge-assist",
+  "GE_PROJECT_ID": "<PROJECT_ID>",
+  "GE_ENGINE_ID": "<ENGINE_ID>",
+  "GE_WEB_GROUNDING": false,
+  "REQUEST_MAX_RETRIES": 1,
+  "PROMPT_LOG_MODE": "none"
+}
