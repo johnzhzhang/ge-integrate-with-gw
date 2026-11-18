@@ -1,0 +1,933 @@
+diff --git a/common/api_type.go b/common/api_type.go
+index 2dc4f6a..431e7d8 100644
+--- a/common/api_type.go
++++ b/common/api_type.go
+@@ -77,6 +77,8 @@ func ChannelType2APIType(channelType int) (int, bool) {
+ 		apiType = constant.APITypeCodex
+ 	case constant.ChannelTypeAdvancedCustom, constant.ChannelTypeVLLM, constant.ChannelTypeSGLang:
+ 		apiType = constant.APITypeAdvancedCustom
++	case constant.ChannelTypeGEAssist:
++		apiType = constant.APITypeGEAssist
+ 	case constant.ChannelTypeSub2API:
+ 		apiType = constant.APITypeSub2API
+ 	case constant.ChannelTypeNewAPI:
+diff --git a/constant/api_type.go b/constant/api_type.go
+index a3eb6ef..0176ba5 100644
+--- a/constant/api_type.go
++++ b/constant/api_type.go
+@@ -42,5 +42,6 @@ const (
+ 	// APITypeProviderPlugin serves a task plugin channel (type 61) whose
+ 	// plugin has relay routes; ChannelType2APIType never returns it.
+ 	APITypeProviderPlugin
++	APITypeGEAssist
+ 	APITypeDummy // this one is only for count, do not add any channel after this
+ )
+diff --git a/constant/channel.go b/constant/channel.go
+index 7549bc2..a940c68 100644
+--- a/constant/channel.go
++++ b/constant/channel.go
+@@ -61,6 +61,7 @@ const (
+ 	ChannelTypeTaskPlugin     = 61
+ 	ChannelTypeVLLM           = 62
+ 	ChannelTypeSGLang         = 63
++	ChannelTypeGEAssist       = 64
+ 	ChannelTypeDummy          // this one is only for count, do not add any channel after this
+ 
+ )
+@@ -132,6 +133,7 @@ var ChannelBaseURLs = []string{
+ 	"",                                          //61
+ 	"",                                          //62
+ 	"",                                          //63
++	"https://discoveryengine.googleapis.com",    //64
+ }
+ 
+ func GetChannelBaseURL(channelType int) string {
+@@ -199,6 +201,7 @@ var ChannelTypeNames = map[int]string{
+ 	ChannelTypeAdvancedCustom: "Advanced Custom",
+ 	ChannelTypeSub2API:        "Sub2API",
+ 	ChannelTypeNewAPI:         "New API",
++	ChannelTypeGEAssist:       "Gemini Enterprise",
+ 	ChannelTypeTaskPlugin:     "Task Plugin",
+ 	ChannelTypeVLLM:           "vLLM",
+ 	ChannelTypeSGLang:         "SGLang",
+diff --git a/middleware/distributor.go b/middleware/distributor.go
+index c625b68..8115fad 100644
+--- a/middleware/distributor.go
++++ b/middleware/distributor.go
+@@ -748,6 +748,8 @@ func SetupContextForSelectedChannel(c *gin.Context, channel *model.Channel, mode
+ 		c.Set("api_version", channel.Other)
+ 	case constant.ChannelTypeCoze:
+ 		c.Set("bot_id", channel.Other)
++	case constant.ChannelTypeGEAssist:
++		c.Set("api_version", channel.Other) // {"project_id","engine_id",...}
+ 	}
+ 	return nil
+ }
+diff --git a/relay/channel/geminienterprise/adaptor.go b/relay/channel/geminienterprise/adaptor.go
+new file mode 100644
+index 0000000..3d80b55
+--- /dev/null
++++ b/relay/channel/geminienterprise/adaptor.go
+@@ -0,0 +1,167 @@
++// Package geminienterprise 通过 Discovery Engine API（Gemini Enterprise 助手 streamAssist）调用 GE 中的 Gemini 模型。
++//
++// 上游：POST {base}/v1alpha/projects/{project}/locations/{location}/collections/default_collection/
++//
++//	engines/{engine}/assistants/default_assistant:streamAssist
++//
++// 渠道配置：
++//   - 密钥：服务账号 JSON，或 "adc"（在 GCE / Cloud Run / GKE 上用运行身份）
++//   - 其他：{"project_id":"…","engine_id":"…","location":"global","web_grounding":false}
++//   - Base URL：默认 https://discoveryengine.googleapis.com
++package geminienterprise
++
++import (
++	"errors"
++	"fmt"
++	"io"
++	"net/http"
++	"strings"
++
++	"github.com/QuantumNous/new-api/common"
++	"github.com/QuantumNous/new-api/relay/channel"
++	"github.com/QuantumNous/new-api/relay/channel/openai"
++	relaycommon "github.com/QuantumNous/new-api/relay/common"
++	"github.com/QuantumNous/new-api/relaykit/dto"
++	"github.com/QuantumNous/new-api/relaykit/types"
++	"github.com/QuantumNous/new-api/service"
++
++	"github.com/gin-gonic/gin"
++)
++
++type Adaptor struct {
++	cfg      Config
++	jsonMode bool
++}
++
++func (a *Adaptor) Init(info *relaycommon.RelayInfo) {}
++
++func (a *Adaptor) loadConfig(info *relaycommon.RelayInfo) error {
++	cfg := Config{}
++	if s := strings.TrimSpace(info.ApiVersion); s != "" { // 渠道“其他”字段
++		if err := common.Unmarshal([]byte(s), &cfg); err != nil {
++			return fmt.Errorf("channel \"other\" must be JSON like {\"project_id\":\"…\",\"engine_id\":\"…\"}: %w", err)
++		}
++	}
++	if cfg.ProjectID == "" {
++		if creds, _ := parseServiceAccount(info.ApiKey); creds != nil {
++			cfg.ProjectID = creds.ProjectID
++		}
++	}
++	if cfg.Location == "" {
++		cfg.Location = "global"
++	}
++	if cfg.ProjectID == "" || cfg.EngineID == "" {
++		return errors.New("gemini-enterprise channel requires project_id and engine_id in \"other\"")
++	}
++	a.cfg = cfg
++	return nil
++}
++
++func (a *Adaptor) GetRequestURL(info *relaycommon.RelayInfo) (string, error) {
++	if err := a.loadConfig(info); err != nil {
++		return "", err
++	}
++	base := strings.TrimRight(info.ChannelBaseUrl, "/")
++	if base == "" {
++		base = DefaultBaseURL
++	}
++	return fmt.Sprintf("%s/v1alpha/projects/%s/locations/%s/collections/default_collection/engines/%s/assistants/default_assistant:streamAssist",
++		base, a.cfg.ProjectID, a.cfg.Location, a.cfg.EngineID), nil
++}
++
++func (a *Adaptor) SetupRequestHeader(c *gin.Context, req *http.Header, info *relaycommon.RelayInfo) error {
++	channel.SetupApiRequestHeader(info, c, req)
++	if a.cfg.ProjectID == "" {
++		if err := a.loadConfig(info); err != nil {
++			return err
++		}
++	}
++	token, err := getAccessToken(info)
++	if err != nil {
++		return err
++	}
++	req.Set("Authorization", "Bearer "+token)
++	req.Set("X-Goog-User-Project", a.cfg.ProjectID) // 计费 / 配额项目
++	return nil
++}
++
++func (a *Adaptor) ConvertOpenAIRequest(c *gin.Context, info *relaycommon.RelayInfo, request *dto.GeneralOpenAIRequest) (any, error) {
++	if request == nil {
++		return nil, errors.New("request is nil")
++	}
++	if err := a.loadConfig(info); err != nil {
++		return nil, err
++	}
++	a.jsonMode = wantsJSON(request)
++	tools := map[string]any{} // {} = 不联网
++	if a.cfg.WebGrounding {
++		tools["webGroundingSpec"] = map[string]any{}
++	}
++	return &AssistRequest{
++		Query:          AssistQuery{Text: buildQueryText(request)},
++		GenerationSpec: &GenerationSpec{ModelID: modelID(info.UpstreamModelName)},
++		ToolsSpec:      tools,
++	}, nil
++}
++
++func (a *Adaptor) DoRequest(c *gin.Context, info *relaycommon.RelayInfo, requestBody io.Reader) (any, error) {
++	resp, err := channel.DoApiRequest(a, c, info, requestBody)
++	if err == nil && resp != nil && resp.StatusCode != http.StatusOK {
++		unwrapErrorBody(resp)
++	}
++	return resp, err
++}
++
++func (a *Adaptor) DoResponse(c *gin.Context, resp *http.Response, info *relaycommon.RelayInfo) (usage any, err *types.NewAPIError) {
++	// streamAssist 输出 → OpenAI 格式，再交给 OpenAI 处理器（负责转成客户端要的 OpenAI/Claude/Gemini 格式和 usage 估算）
++	if info.IsStream {
++		return openai.OaiStreamHandler(c, info, toOpenAISSE(c, info, resp, a.jsonMode))
++	}
++	r, e := toOpenAIJSON(c, info, resp, a.jsonMode)
++	if e != nil {
++		return nil, types.NewError(e, types.ErrorCodeBadResponseBody)
++	}
++	return openai.OpenaiHandler(c, info, r)
++}
++
++func (a *Adaptor) GetModelList() []string { return ModelList }
++func (a *Adaptor) GetChannelName() string { return ChannelName }
++
++// ConvertClaudeRequest / ConvertGeminiRequest：先用 new-api 的转换器转成 OpenAI 请求，再走同一条路径
++func (a *Adaptor) ConvertClaudeRequest(c *gin.Context, info *relaycommon.RelayInfo, request *dto.ClaudeRequest) (any, error) {
++	return a.viaOpenAI(c, info, request)
++}
++
++func (a *Adaptor) ConvertGeminiRequest(c *gin.Context, info *relaycommon.RelayInfo, request *dto.GeminiChatRequest) (any, error) {
++	return a.viaOpenAI(c, info, request)
++}
++
++func (a *Adaptor) viaOpenAI(c *gin.Context, info *relaycommon.RelayInfo, request any) (any, error) {
++	result, err := service.ConvertRequest(c, info, types.RelayFormatOpenAI, request)
++	if err != nil {
++		return nil, err
++	}
++	req, ok := result.Value.(*dto.GeneralOpenAIRequest)
++	if !ok {
++		return nil, fmt.Errorf("expected OpenAI chat completions request, got %T", result.Value)
++	}
++	return a.ConvertOpenAIRequest(c, info, req)
++}
++
++// ---- 不支持的接口 ----
++
++func (a *Adaptor) ConvertRerankRequest(*gin.Context, int, dto.RerankRequest) (any, error) {
++	return nil, errors.New("not supported")
++}
++func (a *Adaptor) ConvertEmbeddingRequest(*gin.Context, *relaycommon.RelayInfo, dto.EmbeddingRequest) (any, error) {
++	return nil, errors.New("not supported")
++}
++func (a *Adaptor) ConvertAudioRequest(*gin.Context, *relaycommon.RelayInfo, dto.AudioRequest) (io.Reader, error) {
++	return nil, errors.New("not supported")
++}
++func (a *Adaptor) ConvertImageRequest(*gin.Context, *relaycommon.RelayInfo, dto.ImageRequest) (any, error) {
++	return nil, errors.New("not supported")
++}
++func (a *Adaptor) ConvertOpenAIResponsesRequest(*gin.Context, *relaycommon.RelayInfo, dto.OpenAIResponsesRequest) (any, error) {
++	return nil, errors.New("gemini-enterprise: Responses API not supported, use /v1/chat/completions")
++}
+diff --git a/relay/channel/geminienterprise/auth.go b/relay/channel/geminienterprise/auth.go
+new file mode 100644
+index 0000000..152b2e7
+--- /dev/null
++++ b/relay/channel/geminienterprise/auth.go
+@@ -0,0 +1,106 @@
++package geminienterprise
++
++import (
++	"encoding/json"
++	"fmt"
++	"net/http"
++	"strings"
++	"sync"
++	"time"
++
++	"github.com/QuantumNous/new-api/common"
++	"github.com/QuantumNous/new-api/relay/channel/vertex"
++	relaycommon "github.com/QuantumNous/new-api/relay/common"
++	"github.com/QuantumNous/new-api/service"
++)
++
++// 渠道密钥两种写法：
++//   - "adc"：在 GCE / Cloud Run / GKE 上用元数据服务器取运行身份的 token，不需要存密钥
++//   - 服务账号 JSON：用 JWT 换 token（复用 vertex 渠道的实现）
++const keyADC = "adc"
++
++const metadataTokenURL = "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token"
++
++type cachedToken struct {
++	token     string
++	identity  string
++	expiresAt time.Time
++}
++
++var tokenCache sync.Map // key: 渠道 ID[-多密钥序号]
++
++func isADC(key string) bool { return strings.EqualFold(strings.TrimSpace(key), keyADC) }
++
++// parseServiceAccount 解析服务账号 JSON；密钥是 "adc" 时返回 nil
++func parseServiceAccount(key string) (*vertex.Credentials, error) {
++	if isADC(key) {
++		return nil, nil
++	}
++	creds := &vertex.Credentials{}
++	if err := common.Unmarshal([]byte(key), creds); err != nil {
++		return nil, fmt.Errorf("channel key must be \"adc\" or a service account JSON: %w", err)
++	}
++	if creds.ClientEmail == "" || creds.PrivateKey == "" {
++		return nil, fmt.Errorf("service account JSON missing client_email or private_key")
++	}
++	return creds, nil
++}
++
++func getAccessToken(info *relaycommon.RelayInfo) (string, error) {
++	cacheKey := fmt.Sprintf("%d", info.ChannelId)
++	if info.ChannelIsMultiKey {
++		cacheKey = fmt.Sprintf("%d-%d", info.ChannelId, info.ChannelMultiKeyIndex)
++	}
++	creds, err := parseServiceAccount(info.ApiKey)
++	if err != nil {
++		return "", err
++	}
++	identity := keyADC
++	if creds != nil {
++		identity = creds.ClientEmail + "\x00" + creds.PrivateKeyID // 换了密钥不复用旧 token
++	}
++	if v, ok := tokenCache.Load(cacheKey); ok {
++		e := v.(cachedToken)
++		if e.identity == identity && time.Now().Before(e.expiresAt) {
++			return e.token, nil
++		}
++	}
++
++	var token string
++	lifetime := 50 * time.Minute // 服务账号 token 有效期 60 分钟，提前 10 分钟刷新
++	if creds == nil {
++		token, lifetime, err = metadataToken()
++	} else {
++		token, err = vertex.AcquireAccessToken(*creds, info.ChannelSetting.Proxy)
++	}
++	if err != nil {
++		return "", err
++	}
++	tokenCache.Store(cacheKey, cachedToken{token: token, identity: identity, expiresAt: time.Now().Add(lifetime)})
++	return token, nil
++}
++
++func metadataToken() (string, time.Duration, error) {
++	req, _ := http.NewRequest(http.MethodGet, metadataTokenURL, nil)
++	req.Header.Set("Metadata-Flavor", "Google")
++	resp, err := service.GetHttpClient().Do(req)
++	if err != nil {
++		return "", 0, fmt.Errorf("metadata server unreachable (key \"adc\" only works on GCE/Cloud Run/GKE): %w", err)
++	}
++	defer resp.Body.Close()
++	if resp.StatusCode != http.StatusOK {
++		return "", 0, fmt.Errorf("metadata token HTTP %d", resp.StatusCode)
++	}
++	var r struct {
++		AccessToken string `json:"access_token"`
++		ExpiresIn   int    `json:"expires_in"`
++	}
++	if err := json.NewDecoder(resp.Body).Decode(&r); err != nil {
++		return "", 0, err
++	}
++	life := time.Duration(r.ExpiresIn)*time.Second - 5*time.Minute
++	if life <= 0 {
++		life = time.Minute
++	}
++	return r.AccessToken, life, nil
++}
+diff --git a/relay/channel/geminienterprise/constants.go b/relay/channel/geminienterprise/constants.go
+new file mode 100644
+index 0000000..87f044f
+--- /dev/null
++++ b/relay/channel/geminienterprise/constants.go
+@@ -0,0 +1,18 @@
++package geminienterprise
++
++// ChannelName 渠道名
++const ChannelName = "gemini-enterprise"
++
++// DefaultBaseURL Discovery Engine API 地址
++const DefaultBaseURL = "https://discoveryengine.googleapis.com"
++
++// ModelList streamAssist generationSpec.modelId 可用的模型 ID（不带 -low/-medium/-high 档位后缀）。
++// 实际能否调用取决于 GE 应用的模型设置和许可证。
++var ModelList = []string{
++	"gemini-3.8-flash",
++	"gemini-3.7-flash",
++	"gemini-3.6-flash",
++	"gemini-3.1-pro-preview",
++	"gemini-2.5-pro",
++	"gemini-4-argon",
++}
+diff --git a/relay/channel/geminienterprise/dto.go b/relay/channel/geminienterprise/dto.go
+new file mode 100644
+index 0000000..e854bc5
+--- /dev/null
++++ b/relay/channel/geminienterprise/dto.go
+@@ -0,0 +1,60 @@
++package geminienterprise
++
++import "encoding/json"
++
++// Config 渠道“其他”字段（JSON）：
++//
++//	{"project_id": "<PROJECT_ID>", "engine_id": "<ENGINE_ID>", "location": "global", "web_grounding": false}
++//
++// project_id 不填时取服务账号 JSON 里的 project_id。
++type Config struct {
++	ProjectID    string `json:"project_id"`
++	EngineID     string `json:"engine_id"`
++	Location     string `json:"location"`
++	WebGrounding bool   `json:"web_grounding"`
++}
++
++// ---- streamAssist 请求 ----
++
++type AssistRequest struct {
++	Query          AssistQuery     `json:"query"`
++	GenerationSpec *GenerationSpec `json:"generationSpec,omitempty"`
++	ToolsSpec      map[string]any  `json:"toolsSpec"`
++}
++
++type AssistQuery struct {
++	Text string `json:"text"`
++}
++
++type GenerationSpec struct {
++	ModelID string `json:"modelId"`
++}
++
++// ---- streamAssist 响应（数组中的每个元素） ----
++
++type AssistResponse struct {
++	Answer      *AssistAnswer   `json:"answer,omitempty"`
++	SessionInfo *SessionInfo    `json:"sessionInfo,omitempty"`
++	Error       json.RawMessage `json:"error,omitempty"`
++}
++
++type AssistAnswer struct {
++	State                string          `json:"state"`
++	Replies              []AssistReply   `json:"replies"`
++	AssistSkippedReasons json.RawMessage `json:"assistSkippedReasons,omitempty"`
++}
++
++type AssistReply struct {
++	GroundedContent struct {
++		Content struct {
++			Role     string  `json:"role"`
++			Text     *string `json:"text,omitempty"`
++			Thought  bool    `json:"thought,omitempty"`
++			MimeType string  `json:"mimeType,omitempty"`
++		} `json:"content"`
++	} `json:"groundedContent"`
++}
++
++type SessionInfo struct {
++	Session string `json:"session"`
++}
+diff --git a/relay/channel/geminienterprise/relay.go b/relay/channel/geminienterprise/relay.go
+new file mode 100644
+index 0000000..6086518
+--- /dev/null
++++ b/relay/channel/geminienterprise/relay.go
+@@ -0,0 +1,278 @@
++package geminienterprise
++
++import (
++	"bytes"
++	"encoding/json"
++	"fmt"
++	"io"
++	"net/http"
++	"regexp"
++	"strings"
++
++	"github.com/QuantumNous/new-api/common"
++	relaycommon "github.com/QuantumNous/new-api/relay/common"
++	"github.com/QuantumNous/new-api/relay/helper"
++	"github.com/QuantumNous/new-api/relaykit/dto"
++	"github.com/QuantumNous/new-api/relaykit/types"
++	"github.com/QuantumNous/new-api/service"
++	"github.com/QuantumNous/new-api/tokenkit"
++
++	"github.com/gin-gonic/gin"
++)
++
++var levelSuffix = regexp.MustCompile(`-(low|medium|high)$`)
++var jsonFence = regexp.MustCompile("(?s)^```(?:json)?\\s*(.*?)\\s*```$")
++
++// modelID streamAssist 的 modelId 不带档位后缀
++func modelID(model string) string {
++	return levelSuffix.ReplaceAllString(strings.TrimPrefix(model, "models/"), "")
++}
++
++func roleLabel(role string) string {
++	switch role {
++	case "system", "developer":
++		return "系统指令"
++	case "assistant":
++		return "助手"
++	default:
++		return "用户"
++	}
++}
++
++func wantsJSON(req *dto.GeneralOpenAIRequest) bool {
++	return req.ResponseFormat != nil && (req.ResponseFormat.Type == "json_object" || req.ResponseFormat.Type == "json_schema")
++}
++
++// buildQueryText 把 OpenAI messages 压平成 streamAssist 的 query.text。
++// streamAssist 没有 systemInstruction / 历史 / JSON Schema 字段，只能写进同一段文字。
++func buildQueryText(req *dto.GeneralOpenAIRequest) string {
++	type seg struct{ role, text string }
++	segs := make([]seg, 0, len(req.Messages))
++	for i := range req.Messages {
++		m := &req.Messages[i]
++		if t := m.StringContent(); t != "" {
++			segs = append(segs, seg{m.Role, t})
++		}
++	}
++	var b strings.Builder
++	if len(segs) == 1 && segs[0].role == "user" {
++		b.WriteString(segs[0].text) // 单条用户消息直接发原文
++	} else {
++		for i, s := range segs {
++			label := roleLabel(s.role)
++			if i == len(segs)-1 && label == "用户" {
++				label = "本次用户消息"
++			}
++			if b.Len() > 0 {
++				b.WriteString("\n\n")
++			}
++			b.WriteString("【" + label + "】\n" + s.text)
++		}
++	}
++	if wantsJSON(req) {
++		b.WriteString("\n\n只输出一个 JSON 对象，不要用 Markdown 代码块包裹，不要输出 JSON 以外的任何文字。")
++		if req.ResponseFormat.Type == "json_schema" && len(req.ResponseFormat.JsonSchema) > 0 {
++			var js struct {
++				Schema json.RawMessage `json:"schema"`
++			}
++			if common.Unmarshal(req.ResponseFormat.JsonSchema, &js) == nil && len(js.Schema) > 0 {
++				b.WriteString("JSON 必须符合以下 JSON Schema：\n" + string(js.Schema))
++			}
++		}
++	}
++	return b.String()
++}
++
++func stripFence(t string) string {
++	t = strings.TrimSpace(t)
++	if m := jsonFence.FindStringSubmatch(t); m != nil {
++		return m[1]
++	}
++	return t
++}
++
++// unwrapErrorBody streamAssist 的错误体是数组 [{"error":{...}}]，new-api 的通用错误处理只认对象，这里展开第一个元素
++func unwrapErrorBody(resp *http.Response) {
++	body, err := io.ReadAll(resp.Body)
++	resp.Body.Close()
++	if err != nil {
++		resp.Body = io.NopCloser(bytes.NewReader(nil))
++		return
++	}
++	var arr []json.RawMessage
++	if common.Unmarshal(body, &arr) == nil && len(arr) > 0 {
++		body = arr[0]
++	}
++	resp.Body = io.NopCloser(bytes.NewReader(body))
++	resp.ContentLength = int64(len(body))
++}
++
++// iterate 用 json.Decoder 增量读取响应数组，每读到一个元素回调一次（真正的流式，且按 UTF-8 正确解码）
++func iterate(body io.Reader, fn func(*AssistResponse) error) error {
++	dec := json.NewDecoder(body)
++	tok, err := dec.Token()
++	if err != nil {
++		return err
++	}
++	if d, ok := tok.(json.Delim); !ok || d != '[' {
++		return fmt.Errorf("unexpected streamAssist response start: %v", tok)
++	}
++	for dec.More() {
++		var el AssistResponse
++		if err := dec.Decode(&el); err != nil {
++			return err
++		}
++		if len(el.Error) > 0 {
++			return fmt.Errorf("streamAssist error: %s", string(el.Error))
++		}
++		if el.Answer != nil && (el.Answer.State == "FAILED" || el.Answer.State == "SKIPPED") {
++			return fmt.Errorf("streamAssist answer %s: %s", el.Answer.State, string(el.Answer.AssistSkippedReasons))
++		}
++		if err := fn(&el); err != nil {
++			return err
++		}
++	}
++	return nil
++}
++
++// texts 取一个元素中的正文和思考摘要；跳过带 mimeType 的块（推荐问题等）
++func texts(el *AssistResponse) (content, thought string) {
++	if el.Answer == nil {
++		return
++	}
++	for _, r := range el.Answer.Replies {
++		c := r.GroundedContent.Content
++		if c.Text == nil || c.MimeType != "" {
++			continue
++		}
++		if c.Thought {
++			thought += *c.Text
++		} else {
++			content += *c.Text
++		}
++	}
++	return
++}
++
++func readAll(resp *http.Response) (content, thought string, err error) {
++	var cb, tb strings.Builder
++	err = iterate(resp.Body, func(el *AssistResponse) error {
++		c, t := texts(el)
++		cb.WriteString(c)
++		tb.WriteString(t)
++		return nil
++	})
++	return strings.TrimRight(cb.String(), " \t\r\n"), tb.String(), err
++}
++
++// estimateUsage streamAssist 不返回 token 数，按文本估算（与 new-api 本地计数方式一致）
++func estimateUsage(info *relaycommon.RelayInfo, text string) dto.Usage {
++	u := dto.Usage{PromptTokens: info.GetEstimatePromptTokens(), CompletionTokens: tokenkit.Estimate(info.UpstreamModelName, text)}
++	u.TotalTokens = u.PromptTokens + u.CompletionTokens
++	return u
++}
++
++// 下面把 streamAssist 的输出改写成 OpenAI chat completions 格式，再交给 new-api 现成的 OpenAI 处理器。
++// 这样 OpenAI / Claude / Gemini 三种客户端格式的响应转换、usage 估算、计费都复用现有逻辑。
++
++// toOpenAIJSON 非流式：读完整个数组，生成 OpenAI chat.completion JSON
++func toOpenAIJSON(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Response, jsonMode bool) (*http.Response, error) {
++	content, thought, err := readAll(resp)
++	service.CloseResponseBodyGracefully(resp)
++	if err != nil {
++		return nil, err
++	}
++	if jsonMode {
++		content = stripFence(content)
++	}
++	msg := dto.Message{Role: "assistant", Content: content}
++	if thought != "" {
++		msg.ReasoningContent = &thought
++	}
++	out := dto.OpenAITextResponse{
++		Id:      helper.GetResponseID(c),
++		Object:  "chat.completion",
++		Created: common.GetTimestamp(),
++		Model:   info.UpstreamModelName,
++		Choices: []dto.OpenAITextResponseChoice{{Index: 0, Message: msg, FinishReason: "stop"}},
++		Usage:   estimateUsage(info, thought+content),
++	}
++	data, err := common.Marshal(out)
++	if err != nil {
++		return nil, err
++	}
++	return synthetic(resp, "application/json", io.NopCloser(bytes.NewReader(data))), nil
++}
++
++// toOpenAISSE 流式：边读 streamAssist 数组边写 OpenAI SSE（data: {...}），用 io.Pipe 保持真正的流式
++func toOpenAISSE(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Response, jsonMode bool) *http.Response {
++	pr, pw := io.Pipe()
++	id := helper.GetResponseID(c)
++	created := common.GetTimestamp()
++	model := info.UpstreamModelName
++	write := func(v any) error {
++		b, err := common.Marshal(v)
++		if err != nil {
++			return err
++		}
++		_, err = pw.Write([]byte("data: " + string(b) + "\n\n"))
++		return err
++	}
++	chunk := func(content, reasoning string) *dto.ChatCompletionsStreamResponse {
++		ch := dto.ChatCompletionsStreamResponseChoice{Index: 0}
++		if content != "" {
++			ch.Delta.SetContentString(content)
++		}
++		if reasoning != "" {
++			ch.Delta.SetReasoningContent(reasoning)
++		}
++		return &dto.ChatCompletionsStreamResponse{Id: id, Object: "chat.completion.chunk", Created: created, Model: model,
++			Choices: []dto.ChatCompletionsStreamResponseChoice{ch}}
++	}
++	go func() {
++		defer service.CloseResponseBodyGracefully(resp)
++		var err error
++		var all strings.Builder // 用于估算 completion tokens
++		if jsonMode {
++			// JSON 要拿到完整回答才能去掉代码块，整段作为一个块发出
++			var content, thought string
++			if content, thought, err = readAll(resp); err == nil {
++				content = stripFence(content)
++				all.WriteString(thought + content)
++				err = write(chunk(content, thought))
++			}
++		} else {
++			err = iterate(resp.Body, func(el *AssistResponse) error {
++				content, thought := texts(el)
++				if content == "" && thought == "" {
++					return nil
++				}
++				all.WriteString(thought + content)
++				return write(chunk(content, thought))
++			})
++		}
++		if err == nil {
++			err = write(helper.GenerateStopResponse(id, created, model, "stop"))
++		}
++		if err == nil && (info.ShouldIncludeUsage || info.RelayFormat != types.RelayFormatOpenAI) {
++			// 显式给出 usage 块：new-api 在 Claude/Gemini 格式下不会从流文本里累计 token，没有这个块会记成 0。
++			// OpenAI 客户端没要 include_usage 时不发，由 OaiStreamHandler 自己按文本估算。
++			err = write(helper.GenerateFinalUsageResponse(id, created, model, estimateUsage(info, all.String())))
++		}
++		if err == nil {
++			_, err = pw.Write([]byte("data: [DONE]\n\n"))
++		}
++		if err != nil {
++			common.SysLog(common.LogText("gemini-enterprise stream error: %s", err.Error()))
++		}
++		_ = pw.CloseWithError(err)
++	}()
++	return synthetic(resp, "text/event-stream", pr)
++}
++
++func synthetic(orig *http.Response, contentType string, body io.ReadCloser) *http.Response {
++	h := http.Header{}
++	h.Set("Content-Type", contentType)
++	return &http.Response{StatusCode: http.StatusOK, Status: "200 OK", Header: h, Body: body,
++		ContentLength: -1, Request: orig.Request, Proto: orig.Proto, ProtoMajor: orig.ProtoMajor, ProtoMinor: orig.ProtoMinor}
++}
+diff --git a/relay/channel/geminienterprise/relay_test.go b/relay/channel/geminienterprise/relay_test.go
+new file mode 100644
+index 0000000..bcfd5f8
+--- /dev/null
++++ b/relay/channel/geminienterprise/relay_test.go
+@@ -0,0 +1,73 @@
++package geminienterprise
++
++import (
++	"encoding/json"
++	"strings"
++	"testing"
++
++	"github.com/QuantumNous/new-api/relaykit/dto"
++)
++
++func TestModelID(t *testing.T) {
++	for in, want := range map[string]string{
++		"gemini-3.8-flash":           "gemini-3.8-flash",
++		"gemini-3.8-flash-low":       "gemini-3.8-flash",
++		"models/gemini-4-argon-high": "gemini-4-argon",
++	} {
++		if got := modelID(in); got != want {
++			t.Errorf("modelID(%q)=%q want %q", in, got, want)
++		}
++	}
++}
++
++func TestBuildQueryText(t *testing.T) {
++	single := &dto.GeneralOpenAIRequest{Messages: []dto.Message{{Role: "user", Content: "你好"}}}
++	if got := buildQueryText(single); got != "你好" {
++		t.Errorf("single message should be sent as-is, got %q", got)
++	}
++	multi := &dto.GeneralOpenAIRequest{
++		Messages: []dto.Message{
++			{Role: "system", Content: "S"}, {Role: "user", Content: "U1"},
++			{Role: "assistant", Content: "A1"}, {Role: "user", Content: "U2"},
++		},
++		ResponseFormat: &dto.ResponseFormat{Type: "json_schema", JsonSchema: json.RawMessage(`{"name":"x","schema":{"type":"object"}}`)},
++	}
++	got := buildQueryText(multi)
++	for _, want := range []string{"【系统指令】\nS", "【用户】\nU1", "【助手】\nA1", "【本次用户消息】\nU2", `{"type":"object"}`} {
++		if !strings.Contains(got, want) {
++			t.Errorf("query text missing %q:\n%s", want, got)
++		}
++	}
++}
++
++func TestStripFence(t *testing.T) {
++	if got := stripFence("```json\n{\"a\":1}\n```\n"); got != `{"a":1}` {
++		t.Errorf("stripFence got %q", got)
++	}
++	if got := stripFence(`{"a":1}`); got != `{"a":1}` {
++		t.Errorf("stripFence changed plain JSON: %q", got)
++	}
++}
++
++func TestIterateAndTexts(t *testing.T) {
++	body := `[{"answer":{"state":"IN_PROGRESS","replies":[
++	   {"groundedContent":{"content":{"role":"model","text":"想一想","thought":true}}},
++	   {"groundedContent":{"content":{"role":"model","text":"杭州"}}}]}},
++	 {"answer":{"state":"IN_PROGRESS","replies":[
++	   {"groundedContent":{"content":{"role":"model","text":"很美\n\n"}}},
++	   {"groundedContent":{"content":{"role":"model","text":"[]","mimeType":"application/json+suggestions"}}}]}},
++	 {"answer":{"state":"SUCCEEDED"},"sessionInfo":{"session":"s"}}]`
++	var content, thought string
++	err := iterate(strings.NewReader(body), func(el *AssistResponse) error {
++		c, th := texts(el)
++		content += c
++		thought += th
++		return nil
++	})
++	if err != nil || content != "杭州很美\n\n" || thought != "想一想" {
++		t.Errorf("err=%v content=%q thought=%q", err, content, thought)
++	}
++	if err := iterate(strings.NewReader(`[{"error":{"code":400}}]`), func(*AssistResponse) error { return nil }); err == nil {
++		t.Error("expected error element to fail")
++	}
++}
+diff --git a/relay/relay_adaptor.go b/relay/relay_adaptor.go
+index 362b49b..a4f6ec3 100644
+--- a/relay/relay_adaptor.go
++++ b/relay/relay_adaptor.go
+@@ -21,6 +21,7 @@ import (
+ 	"github.com/QuantumNous/new-api/relay/channel/deepseek"
+ 	"github.com/QuantumNous/new-api/relay/channel/dify"
+ 	"github.com/QuantumNous/new-api/relay/channel/gemini"
++	"github.com/QuantumNous/new-api/relay/channel/geminienterprise"
+ 	"github.com/QuantumNous/new-api/relay/channel/jimeng"
+ 	"github.com/QuantumNous/new-api/relay/channel/jina"
+ 	"github.com/QuantumNous/new-api/relay/channel/minimax"
+@@ -126,6 +127,8 @@ func GetAdaptor(apiType int) channel.Adaptor {
+ 		return &newapi.Adaptor{}
+ 	case constant.APITypeProviderPlugin:
+ 		return &providerplugin.Adaptor{}
++	case constant.APITypeGEAssist:
++		return &geminienterprise.Adaptor{}
+ 	}
+ 	return nil
+ }
+diff --git a/web/src/features/channels/components/drawers/channel-mutate-drawer.tsx b/web/src/features/channels/components/drawers/channel-mutate-drawer.tsx
+index 1cb66ac..caad15b 100644
+--- a/web/src/features/channels/components/drawers/channel-mutate-drawer.tsx
++++ b/web/src/features/channels/components/drawers/channel-mutate-drawer.tsx
+@@ -4093,6 +4093,30 @@ export function ChannelMutateDrawer({
+               />
+             )}
+ 
++            {/* Gemini Enterprise (type 64) */}
++            {currentType === 64 && (
++              <FormField
++                control={form.control}
++                name='other'
++                render={({ field }) => (
++                  <FormItem>
++                    <FormLabel required>{t('Gemini Enterprise config (JSON)')}</FormLabel>
++                    <FormControl>
++                      <Textarea
++                        rows={3}
++                        placeholder='{"project_id": "<PROJECT_ID>", "engine_id": "<ENGINE_ID>", "location": "global", "web_grounding": false}'
++                        {...field}
++                      />
++                    </FormControl>
++                    <FormDescription>
++                      {t('project_id may be omitted when the key is a service account JSON')}
++                    </FormDescription>
++                    <FormMessage />
++                  </FormItem>
++                )}
++              />
++            )}
++
+             {/* SiliconFlow (type 40) */}
+             {currentType === 40 && (
+               <Alert>
+diff --git a/web/src/features/channels/constants.ts b/web/src/features/channels/constants.ts
+index a5d1874..857a15a 100644
+--- a/web/src/features/channels/constants.ts
++++ b/web/src/features/channels/constants.ts
+@@ -99,6 +99,7 @@ export const CHANNEL_TYPES = {
+   61: 'Task Plugin',
+   62: 'vLLM',
+   63: 'SGLang',
++  64: 'Gemini Enterprise',
+ } as const
+ 
+ export type ChannelProviderPresentation = {
+@@ -182,6 +183,10 @@ export const CHANNEL_PROVIDER_PRESENTATION: Partial<
+   },
+   62: { descriptionKey: 'Connect to self-hosted models served by vLLM' },
+   63: { descriptionKey: 'Connect to self-hosted models served by SGLang' },
++  64: {
++    descriptionKey:
++      'Connect to Gemini models in Gemini Enterprise through the Discovery Engine streamAssist API',
++  },
+ } satisfies Record<
+   Exclude<keyof typeof CHANNEL_TYPES, 0 | typeof CHANNEL_TYPE_TASK_PLUGIN>,
+   ChannelProviderPresentation
+@@ -190,7 +195,7 @@ export const CHANNEL_PROVIDER_PRESENTATION: Partial<
+ const CHANNEL_TYPE_DISPLAY_ORDER: number[] = [
+   1, 14, 24, 33, 43, 3, 41, 17, 45, 25, 26, 23, 48, 60, 58, 59, 61, 42, 34, 20,
+   4, 62, 40, 27, 15, 46, 18, 31, 35, 49, 19, 47, 37, 38, 39, 11, 8, 57, 22, 21,
+-  44, 2, 5, 36, 50, 51, 52, 53, 54, 55, 56,
++  44, 2, 5, 36, 50, 51, 52, 53, 54, 55, 56, 64,
+ ]
+ 
+ export const CHANNEL_TYPE_OPTIONS: { value: number; label: string }[] = (() => {
+@@ -577,6 +582,7 @@ export const TYPE_TO_KEY_PROMPT: Record<number, string> = {
+   60: 'Enter API key for this channel',
+   62: 'vLLM API key, or EMPTY if authentication is disabled',
+   63: 'SGLang API key, or EMPTY if authentication is disabled',
++  64: 'Service account JSON, or "adc" to use the runtime identity on GCE / Cloud Run / GKE',
+ }
+ 
+ export const CHANNEL_TYPE_WARNINGS: Record<number, string> = {
+diff --git a/web/src/features/channels/lib/channel-type-config.ts b/web/src/features/channels/lib/channel-type-config.ts
+index 790018a..ef9332d 100644
+--- a/web/src/features/channels/lib/channel-type-config.ts
++++ b/web/src/features/channels/lib/channel-type-config.ts
+@@ -170,6 +170,17 @@ export const CHANNEL_TYPE_CONFIGS: Record<number, ChannelTypeConfig> = {
+       models: 'Models fetched from upstream /v1/models',
+     },
+   },
++  64: {
++    id: 64,
++    name: CHANNEL_TYPES[64],
++    icon: 'Gemini',
++    hints: {
++      baseUrl: 'Default: https://discoveryengine.googleapis.com',
++      key: 'Service account JSON, or "adc" to use the runtime identity',
++      models: 'gemini-3.8-flash,gemini-2.5-pro',
++      other: '{"project_id": "<PROJECT_ID>", "engine_id": "<ENGINE_ID>", "location": "global", "web_grounding": false}',
++    },
++  },
+   60: {
+     id: 60,
+     name: CHANNEL_TYPES[60],
+diff --git a/web/src/features/channels/lib/channel-utils.ts b/web/src/features/channels/lib/channel-utils.ts
+index 41b96fc..8e5190a 100644
+--- a/web/src/features/channels/lib/channel-utils.ts
++++ b/web/src/features/channels/lib/channel-utils.ts
+@@ -65,6 +65,7 @@ export function getChannelTypeIcon(type: number): string {
+     24: 'Gemini', // Gemini
+     11: 'Google', // PaLM
+     41: 'Gemini', // Vertex AI
++    64: 'Gemini', // Gemini Enterprise
+ 
+     // Cloud providers
+     33: 'Aws', // AWS
