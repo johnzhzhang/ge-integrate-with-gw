@@ -1,5 +1,5 @@
 diff --git a/src/providers/adapter.js b/src/providers/adapter.js
-index a2095f1..da5f180 100644
+index a2095f1..89e76a2 100644
 --- a/src/providers/adapter.js
 +++ b/src/providers/adapter.js
 @@ -1,6 +1,7 @@
@@ -14,7 +14,7 @@ index a2095f1..da5f180 100644
  }
  
  // Antigravity API 服务适配器
-+// Gemini Enterprise via Discovery Engine streamAssist
++// Gemini Enterprise via Discovery Engine (assistants/default_assistant:generateContent)
 +export class GeAssistApiServiceAdapter extends ApiServiceAdapter {
 +    constructor(config) {
 +        super();
