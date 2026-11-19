@@ -8,8 +8,8 @@ AT=$(curl -s -X POST $B/api/user/login -H "Content-Type: application/json" \
   | python3 -c "import json,sys;print(json.load(sys.stdin)['data']['access_token'])")
 H=(-H "Authorization: Bearer $AT" -H "New-Api-User: 1" -H "Content-Type: application/json")
 
-OTHER=$(python3 -c 'import json,os;print(json.dumps({"project_id":os.environ["GE_PROJECT_ID"],"engine_id":os.environ["GE_ENGINE_ID"],"location":"global","web_grounding":False}))')
-BODY=$(OTHER="$OTHER" python3 -c 'import json,os;print(json.dumps({"mode":"single","channel":{"type":64,"name":"gemini-enterprise","key":os.environ.get("GE_KEY","adc"),"base_url":"https://discoveryengine.googleapis.com","other":os.environ["OTHER"],"models":os.environ.get("GE_MODELS","gemini-3.8-flash,gemini-3.7-flash,gemini-2.5-pro,gemini-4-argon"),"group":"default","status":1}}))')
+OTHER=$(python3 -c 'import json,os;print(json.dumps({"project_id":os.environ["GE_PROJECT_ID"],"engine_id":os.environ["GE_ENGINE_ID"],"location":"global"}))')
+BODY=$(OTHER="$OTHER" python3 -c 'import json,os;print(json.dumps({"mode":"single","channel":{"type":64,"name":"gemini-enterprise","key":os.environ.get("GE_KEY","adc"),"base_url":"https://discoveryengine.googleapis.com","other":os.environ["OTHER"],"models":os.environ.get("GE_MODELS","gemini-3.8-flash,gemini-3.8-flash-low,gemini-3.8-flash-medium,gemini-3.8-flash-high,gemini-3.7-flash,gemini-2.5-pro"),"group":"default","status":1}}))')
 echo "add channel: $(curl -s -X POST $B/api/channel/ "${H[@]}" -d "$BODY" | python3 -c 'import json,sys;d=json.load(sys.stdin);print(d["success"],d.get("message",""))')"
 
 echo "add token: $(curl -s -X POST $B/api/token/ "${H[@]}" -d '{"name":"ge-test","remain_quota":0,"unlimited_quota":true,"expired_time":-1}' | python3 -c 'import json,sys;d=json.load(sys.stdin);print(d["success"],d.get("message",""))')"

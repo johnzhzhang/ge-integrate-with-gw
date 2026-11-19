@@ -1,6 +1,6 @@
 # ge-integrate-with-gw：new-api 接入 Gemini Enterprise
 
-给开源 LLM 网关 [new-api](https://github.com/QuantumNous/new-api) 增加原生渠道类型 **Gemini Enterprise（type 64）**。渠道直接调用 Discovery Engine API（GE 助手接口 `streamAssist`），不经过其他代理。客户端可以用 OpenAI、Claude、Gemini 三种格式访问。
+给开源 LLM 网关 [new-api](https://github.com/QuantumNous/new-api) 增加原生渠道类型 **Gemini Enterprise（type 64）**。渠道通过 Discovery Engine API 调用 GE 应用里的 Gemini 模型（`assistants/default_assistant:generateContent`），不经过其他代理。客户端可以用 OpenAI、Claude、Gemini 三种格式访问，支持流式、JSON Schema、思考档位、隐式缓存和真实 token 用量。
 
 | 路径 | 说明 |
 |---|---|
@@ -20,13 +20,15 @@ docker build -t new-api-ge:dev .
 docker run -d --name new-api-ge -p 127.0.0.1:3000:3000 -v $PWD/data:/data new-api-ge:dev
 ```
 
-然后在控制台新建渠道：类型选 **Gemini Enterprise**，密钥填服务账号 JSON 或 `adc`，“其他”填：
+在控制台新建渠道：类型选 **Gemini Enterprise**，密钥填服务账号 JSON 或 `adc`，“其他”填：
 
 ```json
-{"project_id": "<PROJECT_ID>", "engine_id": "<ENGINE_ID>", "location": "global", "web_grounding": false}
+{"project_id": "<PROJECT_ID>", "engine_id": "<ENGINE_ID>", "location": "global"}
 ```
 
-详见 [docs/NEW_API_GUIDE.md](docs/NEW_API_GUIDE.md)。
+模型填 `gemini-3.8-flash-low` 这类带档位后缀的名字，后缀会转成 `thinkingLevel`。详见 [docs/NEW_API_GUIDE.md](docs/NEW_API_GUIDE.md)。
+
+> 上游方法 `assistants/default_assistant:generateContent` 只在 v1alpha 可用，且没有写进 Discovery Engine 的公开接口文档。正式使用前请向 Google 确认支持情况和计费方式。
 
 ## 许可
 
