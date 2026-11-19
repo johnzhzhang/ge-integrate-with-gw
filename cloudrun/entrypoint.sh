@@ -1,6 +1,6 @@
 #!/bin/sh
 # Cloud Run 启动：用环境变量生成 configs/config.json，API Key 来自 Secret Manager 注入的 API_KEY
-# 上游：Discovery Engine API streamAssist（gemini-ge-assist）
+# 上游：Discovery Engine API assistants/default_assistant:generateContent（gemini-ge-assist）
 set -e
 mkdir -p /app/configs
 cat > /app/configs/config.json <<JSON
@@ -10,7 +10,6 @@ cat > /app/configs/config.json <<JSON
   "MODEL_PROVIDER": "gemini-ge-assist",
   "GE_PROJECT_ID": "${GE_PROJECT_ID}",
   "GE_ENGINE_ID": "${GE_ENGINE_ID}",
-  "GE_WEB_GROUNDING": ${GE_WEB_GROUNDING:-false},
   "REQUEST_MAX_RETRIES": 1,
   "PROMPT_LOG_MODE": "none",
   "LOG_ENABLED": true

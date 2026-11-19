@@ -1,13 +1,12 @@
 # AIClient2API 接入 Gemini Enterprise（Discovery Engine API）部署指南
 
-本文说明如何给开源代理 AIClient2API 增加一个 Discovery Engine（Gemini Enterprise 助手接口 `streamAssist`）提供方，并部署到 Cloud Run，对外提供 OpenAI / Claude / Gemini 兼容接口。内容包括实际执行过的每一步操作和核心代码说明。
+本文说明怎样给开源代理 AIClient2API 增加一个 Gemini Enterprise 提供方 `gemini-ge-assist`，并部署到 Cloud Run，对外提供 OpenAI、Claude、Gemini 兼容接口。内容包括实际执行过的每一步操作、核心代码说明和测试方法。
 
 文中项目、账号、地址、密钥等均用占位符表示：
 
 | 占位符 | 含义 |
 |---|---|
 | `<PROJECT_ID>` | GCP 项目 ID |
-| `<PROJECT_NUMBER>` | GCP 项目编号 |
 | `<ENGINE_ID>` | Gemini Enterprise 应用（engine）ID |
 | `<REGION>` | Cloud Run 和 Artifact Registry 所在区域，例如 `us-central1` |
 | `<AR_REPO>` | Artifact Registry Docker 仓库名 |
@@ -17,17 +16,27 @@
 
 ## 1. 方案概述
 
-### 1.1 为什么要改代码
+### 1.1 上游接口
 
-AIClient2API 是把各类客户端专用模型接口转换成 OpenAI 兼容接口的 Node.js 代理。它自带的 Gemini 提供方都不能用来调 Gemini Enterprise：
+```
+POST https://discoveryengine.googleapis.com/v1alpha/projects/<PROJECT_ID>/locations/global/collections/default_collection/engines/<ENGINE_ID>/assistants/default_assistant:generateContent?model=<MODEL_ID>
+POST …/assistants/default_assistant:streamGenerateContent?model=<MODEL_ID>
+```
 
-- `gemini-antigravity`：调 `cloudcode-pa.googleapis.com`，用 Antigravity 桌面客户端的个人账号 OAuth，是消费者渠道。
-- `gemini-cli-oauth`：同样调 `cloudcode-pa`，当前版本已在代码中注释掉。
+- 请求体和响应都是 **Gemini 原生 GenerateContent 格式**：支持 systemInstruction、多轮 contents、responseJsonSchema、thinkingConfig、tools，返回 usageMetadata（含缓存和思考 token）。
+- 模型由 **URL 查询参数 `model`** 指定，不带档位后缀；可用范围取决于 GE 应用的模型设置和许可证。
+- 只在 **v1alpha** 可用，这个方法**没有写进公开 discovery 文档**。正式使用前请向 Google 确认支持情况和计费方式（响应中 `trafficType` 为 `PROVISIONED_THROUGHPUT`）。
+- 不经过 GE 助手的规划流程，也不新建 GE 会话。业务 prompt 首 token 约 1.5~2.5 秒；GE 助手接口 `streamAssist` 要 14~100 秒，而且不支持 JSON Schema、思考档位和 usage。
+
+### 1.2 为什么要改代码
+
+AIClient2API 自带的 Gemini 提供方都不能调 Gemini Enterprise：
+
+- `gemini-antigravity`：调 `cloudcode-pa.googleapis.com`，用个人账号 OAuth，是消费者渠道。
+- `gemini-cli-oauth`：当前版本已在代码中注释掉。
 - `openai-custom`：只能接 OpenAI 兼容接口，Discovery Engine 没有这种接口。
 
-因此需要新增一个提供方 `gemini-ge-assist`，上游调用 Discovery Engine 的 `streamAssist`。
-
-### 1.2 架构
+### 1.3 架构
 
 ```
 客户端（OpenAI / Claude / Gemini SDK）
@@ -35,40 +44,35 @@ AIClient2API 是把各类客户端专用模型接口转换成 OpenAI 兼容接�
    ▼
 AIClient2API（Cloud Run）
    │  ① 内置转换器：OpenAI / Claude 请求 → Gemini 格式
-   │  ② gemini-ge-assist：Gemini 请求 → streamAssist 请求
-   │                      streamAssist 回答 → Gemini 响应
-   │  ③ 内置转换器：Gemini 响应 → OpenAI / Claude 响应
+   │  ② gemini-ge-assist：字段整理、模型后缀 → thinkingLevel、responseSchema → responseJsonSchema
+   │  ③ 调上游；流式响应（连续 JSON 对象）逐个解析
+   │  ④ 内置转换器：Gemini 响应 → OpenAI / Claude 响应（含 usage）
    │  认证：Google ADC（Cloud Run 服务账号）
    ▼
-POST https://discoveryengine.googleapis.com/v1alpha/projects/<PROJECT_ID>/locations/global/
-     collections/default_collection/engines/<ENGINE_ID>/assistants/default_assistant:streamAssist
+Discovery Engine：assistants/default_assistant:(stream)GenerateContent?model=…
 ```
 
-AIClient2API 内部统一用 Gemini 格式调用提供方，所以新提供方只需处理 Gemini 格式；OpenAI、Claude 协议的转换由 AIClient2API 现有的转换器完成。
+AIClient2API 内部统一用 Gemini 格式调用提供方，上游也是 Gemini 格式，所以提供方基本是透传，只处理与 Gemini API 不同的地方：
 
-### 1.3 streamAssist 的限制
-
-streamAssist 是 GE 助手接口，不是模型推理接口：
-
-| 能力 | 支持情况 | 提供方的处理 |
-|---|---|---|
-| 系统指令、对话历史 | 只接受一段 `query.text` | 拼成带标签的一段文字 |
-| JSON Schema | 不支持 | 把 schema 写进文字，回答后去掉 ```json 代码块 |
-| 选择模型 | `generationSpec.modelId`，不带档位后缀 | 去掉客户端传的 `-low/-medium/-high` |
-| thinking 档位 | 不能设置 | 思考摘要作为 thought 输出 |
-| token 用量 | 不返回 | usage 为 0 |
-| 联网搜索 | 由 `toolsSpec` 控制 | 默认 `toolsSpec: {}`，不联网 |
+| 与 Gemini API 的差异 | 提供方的处理 |
+|---|---|
+| URL：`assistants/default_assistant:generateContent?model=` | 拼接 URL，`model` 放查询参数 |
+| 认证：OAuth access token + `X-Goog-User-Project` | `google-auth-library` ADC |
+| 模型 ID 不带档位后缀 | `gemini-3.8-flash-low` → `model=gemini-3.8-flash` + `thinkingLevel: LOW` |
+| `responseSchema` 要求大写 `type` | 改用 `responseJsonSchema`（标准 JSON Schema） |
+| 流式响应是首尾相接的 JSON 对象，不是 SSE | 增量扫描括号，每凑齐一个对象就产出 |
+| AIClient2API 转换器输出 snake_case（`system_instruction`）并带内部字段 | 转成 camelCase，只透传上游认识的字段 |
 
 ## 2. 前提条件
 
 | 项目 | 要求 |
 |---|---|
-| Gemini Enterprise | 项目内已有 GE 应用 `<ENGINE_ID>`，要用的模型在应用的模型设置中为 `MODEL_ENABLED` |
-| 服务账号 | `<SERVICE_ACCOUNT>` 能调用该应用的 streamAssist（例如 `roles/discoveryengine.user`），并有 `roles/serviceusage.serviceUsageConsumer`；按 GE 要求分配许可证 |
+| Gemini Enterprise | 项目内已有 GE 应用 `<ENGINE_ID>`，要用的模型在应用的模型设置中已启用 |
+| 服务账号 | `<SERVICE_ACCOUNT>` 能调用该应用（例如 `roles/discoveryengine.user`），并有 `roles/serviceusage.serviceUsageConsumer`；按 GE 要求分配许可证 |
 | 已启用 API | `discoveryengine.googleapis.com`、`run.googleapis.com`、`artifactregistry.googleapis.com`、`secretmanager.googleapis.com` |
 | 构建机 | Docker、gcloud CLI、git |
 
-确认服务账号能调 streamAssist（在以该服务账号运行的 GCE 机器上执行）：
+先确认服务账号能直接调上游（在以该服务账号运行的 GCE 机器上执行）：
 
 ```bash
 TOKEN=$(curl -s -H "Metadata-Flavor: Google" \
@@ -76,11 +80,11 @@ TOKEN=$(curl -s -H "Metadata-Flavor: Google" \
   | python3 -c "import json,sys;print(json.load(sys.stdin)['access_token'])")
 curl -s -X POST -H "Authorization: Bearer $TOKEN" -H "X-Goog-User-Project: <PROJECT_ID>" \
   -H "Content-Type: application/json" \
-  "https://discoveryengine.googleapis.com/v1alpha/projects/<PROJECT_ID>/locations/global/collections/default_collection/engines/<ENGINE_ID>/assistants/default_assistant:streamAssist" \
-  -d '{"query":{"text":"1+1=? 只回答数字"},"generationSpec":{"modelId":"gemini-3.8-flash"},"toolsSpec":{}}'
+  "https://discoveryengine.googleapis.com/v1alpha/projects/<PROJECT_ID>/locations/global/collections/default_collection/engines/<ENGINE_ID>/assistants/default_assistant:generateContent?model=gemini-3.8-flash" \
+  -d '{"contents":[{"role":"user","parts":[{"text":"1+1=? 只回答数字"}]}],"generationConfig":{"thinkingConfig":{"thinkingLevel":"LOW"}}}'
 ```
 
-返回 HTTP 200 且 `answer.replies` 中有文本即可。查看应用启用了哪些模型：
+返回 `candidates` 和 `usageMetadata` 即可。查看应用启用了哪些模型：
 
 ```bash
 curl -s -H "Authorization: Bearer $(gcloud auth print-access-token)" -H "X-Goog-User-Project: <PROJECT_ID>" \
@@ -99,8 +103,6 @@ git checkout 31b8d90                       # 本文基于的上游版本（3.6.8
 git apply /path/to/ge-assist-provider.patch
 ```
 
-补丁改动 5 个文件（详见第 4 节）：
-
 | 文件 | 改动 |
 |---|---|
 | `src/providers/gemini/ge-assist-core.js` | 新增，提供方实现 |
@@ -115,8 +117,6 @@ git apply /path/to/ge-assist-provider.patch
 docker build -t aiclient2api-ge:3.6.8 .
 ```
 
-使用上游 Dockerfile，不做修改。
-
 ### 3.3 本机验证（可选）
 
 ```bash
@@ -130,31 +130,27 @@ cat > $D/configs/config.json <<JSON
   "MODEL_PROVIDER": "gemini-ge-assist",
   "GE_PROJECT_ID": "<PROJECT_ID>",
   "GE_ENGINE_ID": "<ENGINE_ID>",
-  "GE_WEB_GROUNDING": false,
   "REQUEST_MAX_RETRIES": 1,
   "PROMPT_LOG_MODE": "none"
 }
 JSON
 chmod 600 $D/configs/config.json
-
 docker run -d --name aiclient2api-ge -p 127.0.0.1:3000:3000 \
   -v $D/configs:/app/configs -v $D/plugins:/app/src/plugins-user -v $D/.private:/app/.private \
   aiclient2api-ge:3.6.8
-
 curl -s http://127.0.0.1:3000/v1/models -H "Authorization: Bearer $KEY"
 ```
 
-在 GCE 上运行时，容器通过元数据服务器自动拿到机器服务账号的凭证。其他环境可挂载服务账号 key，并在配置中加 `"GE_CREDENTIALS_FILE": "/app/configs/sa.json"`。
+在 GCE 上，容器通过元数据服务器自动拿到机器服务账号的凭证。其他环境可以挂载服务账号 key，并在配置中加 `"GE_CREDENTIALS_FILE": "/app/configs/sa.json"`。
 
 ### 3.4 构建 Cloud Run 镜像
 
-Cloud Run 不方便挂载可写的配置目录，所以加一层启动脚本，用环境变量生成 `configs/config.json`。
+Cloud Run 不方便挂载可写的配置目录，所以加一层启动脚本，用环境变量生成配置。
 
 `cloudrun/entrypoint.sh`：
 
 ```sh
 #!/bin/sh
-# Cloud Run 启动：用环境变量生成 configs/config.json，API Key 来自 Secret Manager 注入的 API_KEY
 set -e
 mkdir -p /app/configs
 cat > /app/configs/config.json <<JSON
@@ -164,7 +160,6 @@ cat > /app/configs/config.json <<JSON
   "MODEL_PROVIDER": "gemini-ge-assist",
   "GE_PROJECT_ID": "${GE_PROJECT_ID}",
   "GE_ENGINE_ID": "${GE_ENGINE_ID}",
-  "GE_WEB_GROUNDING": ${GE_WEB_GROUNDING:-false},
   "REQUEST_MAX_RETRIES": 1,
   "PROMPT_LOG_MODE": "none",
   "LOG_ENABLED": true
@@ -186,12 +181,10 @@ HEALTHCHECK NONE
 ENTRYPOINT ["/app/cloudrun-entrypoint.sh"]
 ```
 
-`HEALTHCHECK NONE` 关掉上游镜像里针对 3000 端口的 Docker 健康检查，Cloud Run 用自己的启动探测。
-
 构建并推送：
 
 ```bash
-IMAGE=<REGION>-docker.pkg.dev/<PROJECT_ID>/<AR_REPO>/aiclient2api-ge:3.6.8-assist
+IMAGE=<REGION>-docker.pkg.dev/<PROJECT_ID>/<AR_REPO>/aiclient2api-ge:3.6.8-gc
 chmod +x cloudrun/entrypoint.sh
 docker build -f cloudrun/Dockerfile -t $IMAGE .
 gcloud auth configure-docker <REGION>-docker.pkg.dev -q
@@ -202,12 +195,9 @@ docker push $IMAGE
 
 ```bash
 gcloud services enable secretmanager.googleapis.com run.googleapis.com --project <PROJECT_ID>
-
 python3 -c "import secrets;print('sk-ge-'+secrets.token_hex(24), end='')" \
   | gcloud secrets create aiclient2api-ge-api-key --project <PROJECT_ID> \
       --replication-policy=automatic --data-file=-
-
-# 只给运行身份读取这一个密钥的权限
 gcloud secrets add-iam-policy-binding aiclient2api-ge-api-key --project <PROJECT_ID> \
   --member="serviceAccount:<SERVICE_ACCOUNT>" --role=roles/secretmanager.secretAccessor
 ```
@@ -220,47 +210,34 @@ gcloud run deploy aiclient2api-ge --project <PROJECT_ID> --region <REGION> \
   --service-account <SERVICE_ACCOUNT> \
   --port 8080 --cpu 1 --memory 1Gi \
   --timeout 900 --concurrency 40 --min-instances 0 --max-instances 3 \
-  --set-env-vars GE_PROJECT_ID=<PROJECT_ID>,GE_ENGINE_ID=<ENGINE_ID>,GE_WEB_GROUNDING=false \
+  --set-env-vars GE_PROJECT_ID=<PROJECT_ID>,GE_ENGINE_ID=<ENGINE_ID> \
   --set-secrets API_KEY=aiclient2api-ge-api-key:latest \
   --allow-unauthenticated
 ```
 
 | 参数 | 取值原因 |
 |---|---|
-| `--timeout 900` | streamAssist 处理长 prompt 实测可超过 1 分钟 |
-| `--concurrency 40` | 请求大部分时间在等上游，单实例可承载多个并发 |
+| `--timeout 900` | 长 prompt + 高思考档位时可能超过 1 分钟 |
+| `--concurrency 40` | 请求大部分时间在等上游 |
 | `--min-instances 0` | 空闲不计费；需要避免冷启动时改为 1 |
 | `--set-secrets` | 密钥以环境变量注入，不进入镜像和部署配置 |
-| `--allow-unauthenticated` | 让 OpenAI 等客户端直接用 API Key 访问；鉴权由 AIClient2API 的 API Key 完成 |
+| `--allow-unauthenticated` | 让 OpenAI 等客户端直接用 API Key 访问；鉴权由 AIClient2API 完成 |
 
-### 3.7 验证
+### 3.7 验证、更新与清理
 
 ```bash
 URL=<SERVICE_URL>
 KEY=$(gcloud secrets versions access latest --secret aiclient2api-ge-api-key --project <PROJECT_ID>)
-
-curl -s -o /dev/null -w "%{http_code}\n" $URL/v1/models                       # 401，未带 Key
-curl -s $URL/v1/models -H "Authorization: Bearer $KEY"                          # 模型列表
+curl -s -o /dev/null -w "%{http_code}\n" $URL/v1/models                       # 401
 curl -s $URL/v1/chat/completions -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
-  -d '{"model":"gemini-3.8-flash","messages":[{"role":"user","content":"17*23=? 只回答数字"}]}'
-```
+  -d '{"model":"gemini-3.8-flash-low","messages":[{"role":"user","content":"17*23=? 只回答数字"}]}'
 
-查看上游调用日志（每次请求打印 `model -> modelId`、`queryChars`）：
-
-```bash
+# 日志：每次请求打印 model -> 上游方法、模型 ID 和 thinkingLevel
 gcloud logging read 'resource.type="cloud_run_revision" AND resource.labels.service_name="aiclient2api-ge" AND textPayload:"GE Assist"' \
   --project <PROJECT_ID> --limit 20 --format="value(textPayload)"
-```
 
-### 3.8 更新与清理
-
-```bash
-# 代码更新后：重新执行 3.2、3.4 构建推送，再执行
+# 代码更新：重新执行 3.2、3.4，再执行
 gcloud run deploy aiclient2api-ge --project <PROJECT_ID> --region <REGION> --image $IMAGE
-
-# 轮换 API Key：新增版本后重新部署一次，让新实例读到 latest
-python3 -c "import secrets;print('sk-ge-'+secrets.token_hex(24), end='')" \
-  | gcloud secrets versions add aiclient2api-ge-api-key --project <PROJECT_ID> --data-file=-
 
 # 清理
 gcloud run services delete aiclient2api-ge --project <PROJECT_ID> --region <REGION>
@@ -273,155 +250,60 @@ gcloud secrets delete aiclient2api-ge-api-key --project <PROJECT_ID>
 
 AIClient2API 处理一次请求的流程：
 
-1. 根据请求路径判断客户端协议（`/v1/chat/completions` 为 OpenAI，`/v1/messages` 为 Claude，`/v1beta/models/...` 为 Gemini）。
-2. 根据 `MODEL_PROVIDER` 找到提供方。提供方名字以 `gemini-` 开头，AIClient2API 按前缀把它归为 Gemini 协议。
-3. 客户端协议与提供方协议不同时，用转换器把请求转成 Gemini 格式，调用适配器的 `generateContent` / `generateContentStream`，再把结果转回客户端协议。
+1. 根据路径判断客户端协议（`/v1/chat/completions` 为 OpenAI，`/v1/messages` 为 Claude，`/v1beta/models/...` 为 Gemini）。
+2. 根据 `MODEL_PROVIDER` 找到提供方。名字以 `gemini-` 开头，按 Gemini 协议处理。
+3. 协议不同时，用转换器把请求转成 Gemini 格式，调用适配器的 `generateContent` / `generateContentStream`，再把结果转回客户端协议（包括 `usageMetadata` → OpenAI `usage` 的映射）。
 
-因此提供方只需实现 Gemini 格式的 4 个方法：`generateContent`、`generateContentStream`、`listModels`、`isExpiryDateNear`。
-
-### 4.2 注册（constants.js、adapter.js、provider-models.js）
+### 4.2 注册
 
 ```js
-// src/utils/constants.js —— 新增提供方名
-export const MODEL_PROVIDER = {
-    ...
-    GE_ASSIST: 'gemini-ge-assist',
-};
-```
+// src/utils/constants.js
+GE_ASSIST: 'gemini-ge-assist',
 
-```js
 // src/providers/adapter.js —— 适配器只做初始化检查和转发
-import { GeAssistApiService } from './gemini/ge-assist-core.js';
-
 export class GeAssistApiServiceAdapter extends ApiServiceAdapter {
-    constructor(config) {
-        super();
-        this.svc = new GeAssistApiService(config);
-    }
+    constructor(config) { super(); this.svc = new GeAssistApiService(config); }
     async _ensure() { if (!this.svc.isInitialized) await this.svc.initialize(); }
-    async generateContent(model, requestBody) { await this._ensure(); return this.svc.generateContent(model, requestBody); }
-    async *generateContentStream(model, requestBody) { await this._ensure(); yield* this.svc.generateContentStream(model, requestBody); }
+    async generateContent(model, body) { await this._ensure(); return this.svc.generateContent(model, body); }
+    async *generateContentStream(model, body) { await this._ensure(); yield* this.svc.generateContentStream(model, body); }
     async listModels() { return this.svc.listModels(); }
     async refreshToken() { return false; }        // token 由 google-auth-library 自动刷新
     async forceRefreshToken() { return false; }
     isExpiryDateNear() { return false; }
 }
-
 registerAdapter(MODEL_PROVIDER.GE_ASSIST, GeAssistApiServiceAdapter);
-```
 
-```js
-// src/providers/provider-models.js —— /v1/models 返回的模型列表
-'gemini-ge-assist': [
-    'gemini-3.8-flash', 'gemini-3.7-flash', 'gemini-3.6-flash', 'gemini-3.1-pro-preview', 'gemini-2.5-pro', 'gemini-4-argon',
-],
-```
-
-```js
-// src/providers/provider-pool-manager.js —— 账号池健康检查默认模型
-'gemini-ge-assist': 'gemini-3.8-flash',
+// src/providers/provider-models.js —— /v1/models 展示的模型（含档位后缀）
+'gemini-ge-assist': ['gemini-3.8-flash', 'gemini-3.8-flash-low', 'gemini-3.8-flash-medium', 'gemini-3.8-flash-high', ...],
 ```
 
 模型列表只影响 `/v1/models` 的展示，实际能否调用取决于 GE 应用的模型设置和许可证。
 
-### 4.3 提供方实现（ge-assist-core.js）
+### 4.3 ge-assist-core.js 要点
 
-#### 认证
-
-```js
-const authOpts = { scopes: ['https://www.googleapis.com/auth/cloud-platform'] };
-if (config.GE_CREDENTIALS_FILE) authOpts.keyFile = config.GE_CREDENTIALS_FILE;
-this.auth = new GoogleAuth(authOpts);
-...
-const { token } = await (await this.auth.getClient()).getAccessToken();
-```
-
-使用 `google-auth-library`（AIClient2API 已依赖）的 ADC：
-
-- 在 Cloud Run / GCE 上自动从元数据服务器取运行身份的 token。
-- 也可以用 `GOOGLE_APPLICATION_CREDENTIALS` 或 `GE_CREDENTIALS_FILE` 指定服务账号 key。
-- token 由库缓存，过期前自动刷新，每次请求调用 `getAccessToken()` 不会重复申请。
-
-#### 请求转换：`buildQueryText`
-
-streamAssist 只有 `query.text`，所以把系统指令、历史消息和本次消息拼成一段带标签的文字：
-
-```
-【系统指令】
-……
-
-【助手】
-……（历史）
-
-【本次用户消息】
-……
-```
-
-- 只有一条用户消息、没有系统指令时，直接发原文，不加标签。
-- thought 类型的 part（历史中的思考内容）不拼进去。
-- 请求了 JSON（`responseMimeType: application/json`）时，在末尾追加"只输出一个 JSON 对象……"，有 schema 时把 schema 一并写入。OpenAI 的 `response_format: json_schema` 会被转换器转成这两个字段。
-
-#### 请求体：`_open`
-
-```js
-const body = {
-    query: { text: this.buildQueryText(req) },
-    generationSpec: { modelId: this.modelId(model) },               // 去掉 -low/-medium/-high
-    toolsSpec: this.webGrounding ? { webGroundingSpec: {} } : {},   // {} = 不联网
-};
-axios.post(this.url, body, {
-    headers: { Authorization: `Bearer ${token}`, 'X-Goog-User-Project': this.projectId },
-    responseType: 'stream',
-});
-```
-
-- `toolsSpec: {}` 时助手不调用搜索工具；传 `webGroundingSpec` 会调用 `google_search_tool`。
-- `X-Goog-User-Project` 指定计费和配额项目。
-- 上游返回错误时读出错误体写进异常信息。例如 `The model gemini-4-argon is not available during the free trial` 会原样返回给客户端，方便排查。
-
-#### 响应解析：`iterJsonArray`
-
-streamAssist 的流式响应是一个逐步输出的 JSON 数组 `[{...},{...},...]`，不是 SSE。函数逐字符扫描，记录括号深度和是否在字符串内，每凑齐一个顶层元素就 `JSON.parse` 并产出，从而实现真正的流式。
-
-```js
-const dec = new StringDecoder('utf8');
-for await (const chunk of stream) {
-    for (const ch of dec.write(chunk)) { ... }
-}
-```
-
-网络分块可能把一个汉字（UTF-8 3 字节）切在两块里。直接 `chunk.toString()` 会出现乱码（实测出现过）；`StringDecoder` 会把不完整的字节留到下一块再解码。
-
-#### 响应转换：`_toGemini`
-
-每个 streamAssist 元素的 `answer.replies[].groundedContent.content` 转成一个 Gemini 响应块：
-
-| streamAssist | 转换结果 |
-|---|---|
-| `text` + `thought: true` | `{text, thought: true}`，OpenAI 协议下进 `reasoning_content` |
-| `text` | `{text}`，正文 |
-| 带 `mimeType`（推荐问题等） | 跳过 |
-| `error`，或 `answer.state` 为 `FAILED` / `SKIPPED` | 抛异常 |
-
-#### 非流式与 JSON：`generateContent`
-
-- 读完整个数组，拼接正文和思考摘要。
-- 去掉回答末尾固定带的 `\n\n`。
-- JSON 模式下用 `stripFence` 去掉外层 ```json 代码块。
-- 流式请求如果是 JSON 模式，也走这个方法整段返回（`generateContentStream` 第一段判断）。因为只有拿到完整回答才能可靠地去掉代码块。
+- **认证**：`new GoogleAuth({scopes: [cloud-platform]})`。Cloud Run / GCE 上自动用运行身份；也支持 `GE_CREDENTIALS_FILE`。token 由库缓存并自动刷新。
+- **`splitModel`**：`gemini-3.8-flash-low` → `{id: 'gemini-3.8-flash', level: 'LOW'}`。上游 `model=` 不认后缀；上游支持的 `thinkingLevel` 是 LOW、MEDIUM、HIGH。
+- **`buildBody`**：
+  1. 只保留 `contents`、`systemInstruction`、`generationConfig`、`tools`、`toolConfig`、`safetySettings`，并把 `system_instruction` 等 snake_case 字段转成 camelCase。上游不校验未知字段，字段名写错会被静默忽略，系统提示词就丢了，所以必须转换。
+  2. 有 `responseSchema` 且没有 `responseJsonSchema` 时，移到 `responseJsonSchema`。上游的 `responseSchema` 要求大写 `type`，否则报 "didn't specify the schema type field"。
+  3. 有档位后缀时写入 `thinkingConfig.thinkingLevel`，并去掉 `thinkingBudget`，两者互斥。
+- **`_post`**：`axios.post(\`${base}:${method}\`, body, {params: {model: id}, headers: {Authorization, 'X-Goog-User-Project'}})`。出错时从错误体（流式接口是数组 `[{"error":…}]`）取出 `error.message`，原样返回给客户端，例如 `The model gemini-4-argon is not available during the free trial`。
+- **`iterJsonObjects`**：上游流式响应是 `{...}{...}{...}`。逐字符记录括号深度和是否在字符串内，深度回到 0 时 `JSON.parse` 一个对象并产出。用 `StringDecoder` 解码，网络分块切断汉字时不会乱码。
+- **`generateContent`**：非流式直接返回上游 JSON。
+- **`generateContentStream`**：逐个产出上游的 GenerateContentResponse，usage 由 AIClient2API 转换器从最后一块的 `usageMetadata` 映射。
 
 ### 4.4 完整源码
 
 ```js
 /**
- * Gemini Enterprise via Discovery Engine API（assistants/default_assistant:streamAssist）。
+ * Gemini Enterprise via Discovery Engine API：assistants/default_assistant:(stream)GenerateContent?model=…
  *
- * streamAssist 是 GE 助手接口，只接受一段 query.text，没有 systemInstruction / contents 历史 /
- * generationConfig / JSON Schema，也不返回 token 用量。本提供方把 Gemini 请求压平成一段文字：
- *   【系统指令】… 【用户】… 【助手】… （历史）… 最后一条用户消息
- * 请求了 JSON（responseMimeType=application/json）时，在末尾加格式要求，并去掉回答外层的 ```json 代码块。
- *
- * 模型：generationSpec.modelId，不带档位后缀（客户端传 -low/-medium/-high 会被去掉）。
+ * 这是 Discovery Engine v1alpha 里未写入公开 discovery 文档的方法。请求体和响应都是 Gemini 原生
+ * GenerateContent 格式，所以本提供方基本是透传：
+ *   - 模型用 URL 查询参数 model 指定，不带档位后缀；客户端传 -low/-medium/-high 时转成 thinkingLevel
+ *   - 只透传上游认识的字段（上游不校验未知字段，但 AIClient2API 内部字段没必要发出去）
+ *   - responseSchema（要求大写 type）改用 responseJsonSchema（标准 JSON Schema）
+ *   - 流式响应是首尾相接的 JSON 对象（不是 SSE），增量解析后逐个产出
  * 认证：Google ADC（GCE/Cloud Run 服务账号，或 GE_CREDENTIALS_FILE）。
  */
 import axios from 'axios';
@@ -432,30 +314,22 @@ import { getProviderModels } from '../provider-models.js';
 import { MODEL_PROVIDER } from '../../utils/common.js';
 
 const BASE = 'https://discoveryengine.googleapis.com/v1alpha';
-const ROLE = { user: '用户', model: '助手', assistant: '助手' };
+const ALLOWED_FIELDS = ['contents', 'systemInstruction', 'generationConfig', 'tools', 'toolConfig', 'safetySettings'];
+const SNAKE_ALIASES = { system_instruction: 'systemInstruction', generation_config: 'generationConfig',
+    tool_config: 'toolConfig', safety_settings: 'safetySettings' };
 
-function partsText(parts) {
-    return (parts || []).filter(p => typeof p?.text === 'string' && !p.thought).map(p => p.text).join('');
-}
-
-function stripFence(t) {
-    const m = String(t).trim().match(/^```(?:json)?\s*([\s\S]*?)\s*```$/i);
-    return m ? m[1] : t;
-}
-
-/** 增量解析 streamAssist 返回的 JSON 数组 `[{...},{...}]`，每凑齐一个元素就产出 */
-async function* iterJsonArray(stream) {
+/** 增量解析首尾相接的 JSON 对象流 `{...}{...}`（也兼容数组包裹 `[{...},{...}]`），每凑齐一个对象就产出 */
+async function* iterJsonObjects(stream) {
     let depth = 0, inStr = false, esc = false, buf = '';
-    const dec = new StringDecoder('utf8');     // 网络分块可能切断多字节汉字，必须用 StringDecoder
+    const dec = new StringDecoder('utf8');     // 网络分块可能切断多字节汉字
     for await (const chunk of stream) {
         for (const ch of dec.write(chunk)) {
-            if (depth === 0) { if (ch === '[') depth = 1; continue; }
-            if (depth === 1 && ch !== '{') { if (ch === ']') depth = 0; continue; }
+            if (depth === 0 && ch !== '{') continue;  // 跳过对象之间的空白、逗号、方括号
             buf += ch;
             if (inStr) { if (esc) esc = false; else if (ch === '\\') esc = true; else if (ch === '"') inStr = false; continue; }
             if (ch === '"') inStr = true;
             else if (ch === '{') depth++;
-            else if (ch === '}') { depth--; if (depth === 1) { yield JSON.parse(buf); buf = ''; } }
+            else if (ch === '}' && --depth === 0) { yield JSON.parse(buf); buf = ''; }
         }
     }
 }
@@ -467,19 +341,18 @@ export class GeAssistApiService {
         this.engineId = config.GE_ENGINE_ID || process.env.GE_ENGINE_ID;
         if (!this.projectId || !this.engineId) throw new Error('GE_PROJECT_ID and GE_ENGINE_ID are required for gemini-ge-assist');
         this.location = config.GE_LOCATION || 'global';
-        this.webGrounding = config.GE_WEB_GROUNDING === true;
         this.timeout = config.GE_TIMEOUT_MS || 600000;
         const authOpts = { scopes: ['https://www.googleapis.com/auth/cloud-platform'] };
         if (config.GE_CREDENTIALS_FILE) authOpts.keyFile = config.GE_CREDENTIALS_FILE;
         this.auth = new GoogleAuth(authOpts);
-        this.url = `${BASE}/projects/${this.projectId}/locations/${this.location}/collections/default_collection/engines/${this.engineId}/assistants/default_assistant:streamAssist`;
+        this.base = `${BASE}/projects/${this.projectId}/locations/${this.location}/collections/default_collection/engines/${this.engineId}/assistants/default_assistant`;
         this.isInitialized = false;
     }
 
     async initialize() {
         await this._token();
         this.isInitialized = true;
-        logger.info(`[GE Assist] project=${this.projectId} engine=${this.engineId} webGrounding=${this.webGrounding}`);
+        logger.info(`[GE Assist] project=${this.projectId} engine=${this.engineId} (generateContent)`);
     }
 
     async _token() {
@@ -488,100 +361,68 @@ export class GeAssistApiService {
         return token;
     }
 
-    modelId(model) {
-        return String(model || '').replace(/^models\//, '').replace(/-(low|medium|high)$/, '');
+    /** "gemini-3.8-flash-low" → { id: "gemini-3.8-flash", level: "LOW" } */
+    splitModel(model) {
+        const m = String(model || '').replace(/^models\//, '');
+        const r = m.match(/-(low|medium|high)$/);
+        return r ? { id: m.slice(0, -r[0].length), level: r[1].toUpperCase() } : { id: m, level: null };
     }
 
-    isJson(req) {
-        const gc = req?.generationConfig || req?.generation_config || {};
-        return gc.responseMimeType === 'application/json' || gc.response_mime_type === 'application/json';
-    }
-
-    /** 把 Gemini 请求压平成 query.text */
-    buildQueryText(req) {
-        const sys = req?.systemInstruction || req?.system_instruction;
-        const contents = req?.contents || [];
-        const out = [];
-        const sysText = sys ? partsText(sys.parts) : '';
-        if (sysText) out.push(`【系统指令】\n${sysText}`);
-        contents.forEach((c, i) => {
-            const t = partsText(c.parts);
-            if (!t) return;
-            const last = i === contents.length - 1 && (c.role || 'user') === 'user';
-            out.push(contents.length === 1 && !sysText ? t : `【${last ? '本次用户消息' : (ROLE[c.role] || '用户')}】\n${t}`);
-        });
-        if (this.isJson(req)) {
-            const gc = req.generationConfig || req.generation_config;
-            const schema = gc.responseJsonSchema || gc.responseSchema || gc.response_json_schema || gc.response_schema;
-            out.push('只输出一个 JSON 对象，不要用 Markdown 代码块包裹，不要输出 JSON 以外的任何文字。'
-                + (schema ? `JSON 必须符合以下 JSON Schema：\n${JSON.stringify(schema)}` : ''));
+    buildBody(req, level) {
+        const body = {};
+        for (const k of ALLOWED_FIELDS) if (req?.[k] !== undefined) body[k] = req[k];
+        // AIClient2API 的 OpenAI→Gemini 转换器输出 snake_case，统一成 camelCase
+        for (const [snake, camel] of Object.entries(SNAKE_ALIASES)) {
+            if (body[camel] === undefined && req?.[snake] !== undefined) body[camel] = req[snake];
         }
-        return out.join('\n\n');
+        const gc = body.generationConfig = { ...(body.generationConfig || {}) };
+        if (gc.responseSchema && !gc.responseJsonSchema) {   // 上游 responseSchema 要求大写 type，改用 responseJsonSchema
+            gc.responseJsonSchema = gc.responseSchema;
+            delete gc.responseSchema;
+        }
+        if (level) gc.thinkingConfig = { ...(gc.thinkingConfig || {}), thinkingLevel: level, thinkingBudget: undefined };
+        if (!Object.keys(gc).length) delete body.generationConfig;
+        return body;
     }
 
-    async _open(model, req) {
-        const body = {
-            query: { text: this.buildQueryText(req) },
-            generationSpec: { modelId: this.modelId(model) },
-            toolsSpec: this.webGrounding ? { webGroundingSpec: {} } : {},   // {} = 不联网
-        };
-        logger.info(`[GE Assist] model=${model} -> modelId=${body.generationSpec.modelId} queryChars=${body.query.text.length} json=${this.isJson(req)}`);
+    async _post(method, model, req, stream) {
+        const { id, level } = this.splitModel(model);
+        const body = this.buildBody(req, level);
+        logger.info(`[GE Assist] model=${model} -> ${method}?model=${id} thinkingLevel=${body.generationConfig?.thinkingConfig?.thinkingLevel || '-'}`);
         try {
-            return await axios.post(this.url, body, {
+            return await axios.post(`${this.base}:${method}`, body, {
+                params: { model: id },
                 headers: { Authorization: `Bearer ${await this._token()}`, 'X-Goog-User-Project': this.projectId, 'Content-Type': 'application/json' },
-                timeout: this.timeout, responseType: 'stream',
+                timeout: this.timeout, responseType: stream ? 'stream' : 'json',
             });
         } catch (error) {
-            if (error.response?.data) {
-                let s = ''; for await (const c of error.response.data) s += c.toString('utf8');
-                error.message = `[GE Assist] HTTP ${error.response.status}: ${s.slice(0, 800)}`;
+            let data = error.response?.data;
+            if (data && typeof data.on === 'function') { let s = ''; for await (const c of data) s += c.toString('utf8'); data = s; }
+            if (error.response) {
+                let msg = typeof data === 'string' ? data : JSON.stringify(data);
+                try { const j = typeof data === 'string' ? JSON.parse(data) : data; msg = (Array.isArray(j) ? j[0] : j)?.error?.message || msg; } catch { /* 保留原文 */ }
+                error.message = `[GE Assist] HTTP ${error.response.status}: ${String(msg).slice(0, 800)}`;
             }
             logger.error(error.message);
             throw error;
         }
     }
 
-    /** streamAssist 元素 → Gemini 响应块（只取文本；思考摘要作为 thought part） */
-    *_toGemini(el) {
-        if (el.error) throw new Error(`[GE Assist] ${JSON.stringify(el.error)}`);
-        const ans = el.answer || {};
-        if (ans.state === 'FAILED' || ans.state === 'SKIPPED') throw new Error(`[GE Assist] answer ${ans.state}: ${JSON.stringify(ans.assistSkippedReasons || [])}`);
-        for (const r of ans.replies || []) {
-            const c = r.groundedContent?.content || {};
-            if (typeof c.text !== 'string' || c.mimeType) continue;          // 跳过推荐问题等非文本
-            yield { candidates: [{ index: 0, content: { role: 'model', parts: [c.thought ? { text: c.text, thought: true } : { text: c.text }] } }] };
-        }
-    }
-
     async generateContent(model, req) {
-        const r = await this._open(model, req);
-        let text = '', thoughts = '', session;
-        for await (const el of iterJsonArray(r.data)) {
-            session = el.sessionInfo?.session || session;
-            for (const g of this._toGemini(el)) {
-                const p = g.candidates[0].content.parts[0];
-                if (p.thought) thoughts += p.text; else text += p.text;
-            }
-        }
-        text = text.replace(/\s+$/, '');      // streamAssist 回答末尾固定带 \n\n
-        if (this.isJson(req)) text = stripFence(text);
-        const parts = []; if (thoughts) parts.push({ text: thoughts, thought: true }); parts.push({ text });
-        return { candidates: [{ index: 0, finishReason: 'STOP', content: { role: 'model', parts } }], modelVersion: this.modelId(model), geAssistSession: session };
+        return (await this._post('generateContent', model, req, false)).data;
     }
 
     async *generateContentStream(model, req) {
-        if (this.isJson(req)) {           // JSON 需要整体去掉代码块，只能整段返回
-            yield await this.generateContent(model, req);
-            return;
+        const r = await this._post('streamGenerateContent', model, req, true);
+        for await (const obj of iterJsonObjects(r.data)) {
+            if (obj.error) throw new Error(`[GE Assist] ${JSON.stringify(obj.error)}`);
+            yield obj;
         }
-        const r = await this._open(model, req);
-        for await (const el of iterJsonArray(r.data)) yield* this._toGemini(el);
-        yield { candidates: [{ index: 0, finishReason: 'STOP', content: { role: 'model', parts: [{ text: '' }] } }], modelVersion: this.modelId(model) };
     }
 
     async listModels() {
         return { models: getProviderModels(MODEL_PROVIDER.GE_ASSIST).map(id => ({
-            name: `models/${id}`, version: '1.0.0', displayName: id, description: `Gemini Enterprise streamAssist ${id}`,
+            name: `models/${id}`, version: '1.0.0', displayName: id, description: `Gemini Enterprise ${id}`,
             inputTokenLimit: 1048576, outputTokenLimit: 65536, supportedGenerationMethods: ['generateContent', 'streamGenerateContent'],
         })) };
     }
@@ -592,7 +433,7 @@ export class GeAssistApiService {
 
 ## 5. 测试方法
 
-测试分三层：先确认 GE 侧可用（不经过代理），再测代理的各项功能，最后测延迟。测试脚本 `smoke_test.py` 只依赖 `requests`，通过环境变量指定服务地址和 Key，不在脚本里写任何项目信息。
+测试分三层：先确认 GE 侧可用（不经过代理），再测代理功能，最后测延迟和缓存。脚本 `smoke_test.py` 只依赖 `requests`，通过环境变量指定服务地址和 Key。
 
 ### 5.1 准备
 
@@ -600,20 +441,20 @@ export class GeAssistApiService {
 pip install requests
 export BASE_URL=<SERVICE_URL>          # 本机测试用 http://127.0.0.1:3000
 export API_KEY=$(gcloud secrets versions access latest --secret aiclient2api-ge-api-key --project <PROJECT_ID>)
-export MODEL=gemini-3.8-flash          # 可选
+export MODEL=gemini-3.8-flash-low
 ```
 
-### 5.2 第一层：直连 streamAssist
+### 5.2 第一层：直连上游
 
-先用第 2 节的 curl 命令，以服务账号身份直接调 streamAssist。这一层失败说明是 GE 侧的问题（权限、许可证、模型未启用），与代理无关：
+用第 2 节的 curl 命令以服务账号身份直接调用。失败时：
 
-| 直连返回 | 原因 | 处理 |
+| 返回 | 原因 | 处理 |
 |---|---|---|
 | 403 `PERMISSION_DENIED` | 服务账号缺 Discovery Engine 权限 | 授予 `roles/discoveryengine.user` |
-| 403 `serviceusage.services.use` | 缺 Service Usage Consumer | 授予 `roles/serviceusage.serviceUsageConsumer` |
-| 400 `not available during the free trial` | 许可证为免费试用，模型受限 | 换付费许可证，或换模型 |
-| 400 `Model ... is disabled by default` | 应用模型设置中未启用 | 管理员在 GE 应用中启用 |
-| 400 `model id ... is invalid` | 模型 ID 带了档位后缀或拼写错误 | 用不带后缀的 ID |
+| 403 `The model xxx is not enabled by the admin` | GE 应用未启用该模型，或模型 ID 带了后缀 | 管理员启用；ID 不带后缀 |
+| 400 `not available during the free trial` | 许可证为免费试用，模型受限 | 换付费许可证或换模型 |
+| 400 `Thinking level is unsupported` | 传了 MINIMAL 等不支持的档位 | 用 LOW / MEDIUM / HIGH |
+| 404 | 不是 v1alpha | 改用 v1alpha |
 
 ### 5.3 第二层：功能测试
 
@@ -621,72 +462,62 @@ export MODEL=gemini-3.8-flash          # 可选
 python3 smoke_test.py
 ```
 
-脚本依次检查：
+| 用例 | 通过条件 |
+|---|---|
+| 鉴权 | 不带 Key 返回 401 |
+| 模型列表 | 包含 `MODEL` |
+| OpenAI 非流式 / 流式 | 回答正确，流式中文无乱码 |
+| 系统指令 + 多轮历史 | 回答含前文让它记住的数字（验证 snake_case 转换） |
+| JSON Schema | 能被 `json.loads` 解析且包含 required 字段（验证 responseJsonSchema 转换） |
+| Claude 协议 | `POST /v1/messages` 返回 text |
+| Gemini 协议 | `POST /v1beta/models/{MODEL}:generateContent` 正确 |
+| argon（信息） | 只打印结果，取决于许可证 |
 
-| 用例 | 请求 | 通过条件 |
-|---|---|---|
-| 鉴权 | 不带 Key 请求 `/v1/models` | 返回 401 |
-| 模型列表 | `GET /v1/models` | 包含 `MODEL` |
-| OpenAI 非流式 | "17*23=?" | 回答含 391 |
-| OpenAI 流式 | 三段话介绍杭州 | 正文 > 50 字 |
-| 流式中文 | 同上 | 正文没有 `\ufffd`（UTF-8 分块解码正确） |
-| 系统指令 + 多轮历史 | system + 第 1 轮"记住 4271"+ 第 3 轮提问 | 回答含 4271（历史被正确拼进 query.text） |
-| JSON Schema | `response_format: json_schema` | 能被 `json.loads` 解析，且包含 required 字段 |
-| Claude 协议 | `POST /v1/messages` | 返回 text 内容 |
-| Gemini 协议 | `POST /v1beta/models/{MODEL}:generateContent` | 回答含 2 |
-| argon（信息） | `gemini-4-argon` | 只打印结果，不计入通过数；结果取决于许可证 |
-
-全部通过时退出码为 0，可以放进 CI 或部署后检查。实测输出：
+实测（Cloud Run）：
 
 ```
 [PASS] 不带 Key 返回 401  401
-[PASS] 模型列表  ['gemini-2.5-pro', 'gemini-3.1-pro-preview', 'gemini-3.6-flash', 'gemini-3.7-flash', 'gemini-3.8-flash', 'gemini-4-argon']
-[PASS] OpenAI 非流式  '391' 7.4s
-[PASS] OpenAI 流式  626 字 首token 2.8s 总 7.7s
+[PASS] 模型列表  [... 'gemini-3.8-flash', 'gemini-3.8-flash-high', 'gemini-3.8-flash-low', 'gemini-3.8-flash-medium', ...]
+[PASS] OpenAI 非流式  '391'
+[PASS] OpenAI 流式  …字 首token 1.2s
 [PASS] 流式中文无乱码
 [PASS] 系统指令 + 多轮历史  '4271'
 [PASS] JSON Schema  ['answer', 'tags']
-[PASS] Claude /v1/messages  ['蓝色']
+[PASS] Claude /v1/messages  ['蓝']
 [PASS] Gemini generateContent  '2'
 [INFO] gemini-4-argon（取决于许可证）: HTTP 400 ... not available during the free trial ...
 
 9/9 通过
 ```
 
-### 5.4 第三层：延迟测试
+### 5.4 第三层：延迟与缓存
 
 ```bash
-python3 smoke_test.py latency 10                                # 默认 prompt：用 300 字介绍杭州
-PROMPT_FILE=./my_prompt.txt python3 smoke_test.py latency 10    # 用自己的长 prompt
+python3 smoke_test.py latency 10                                # 默认短 prompt
+PROMPT_FILE=./my_prompt.txt python3 smoke_test.py latency 10    # 自己的长 prompt
 ```
 
-每次打印首 token、总耗时、正文字数和思考摘要字数，最后汇总中位数和 P90。实测（短 prompt，3 次）：
+长 prompt 实测：约 2.5 万 token 的固定 system prompt + JSON Schema，经 Cloud Run 上的代理连发 5 次（`gemini-3.8-flash-low`，OpenAI 流式 + `include_usage`）：
 
-```
-#1 HTTP 200 首token 3.76s 总 6.72s 正文 438 字 思考摘要 0 字
-#2 HTTP 200 首token 6.86s 总 9.00s 正文 390 字 思考摘要 66 字
-#3 HTTP 200 首token 9.41s 总 12.24s 正文 367 字 思考摘要 131 字
+| 次数 | 首 token | prompt | cached | reasoning | JSON |
+|---|---|---|---|---|---|
+| 1 | 1.52s | 24,888 | 0 | 0 | 正确 |
+| 2 | 1.66s | 24,888 | 20,358 | 0 | 正确 |
+| 3 | 1.35s | 24,888 | 20,358 | 0 | 正确 |
+| 4 | 1.44s | 24,888 | 20,358 | 0 | 正确 |
+| 5 | 1.38s | 24,888 | 20,358 | 0 | 正确 |
 
-首 token 中位数 6.86s P90 9.41s；总耗时中位数 9.00s P90 12.24s（3/3 成功）
-```
-
-- 思考摘要越长，首 token 越慢；streamAssist 不能关闭思考，所以延迟波动大。
-- 约 4 万字的业务 prompt 实测首 token 14~100 秒。评估时至少跑 10 次看 P90。
-- 区分代理开销和上游耗时：对同一 prompt，用第 2 节的 curl 直连 streamAssist 计时，与经代理的结果对比。
+- `-low` 后缀生效，没有思考 token。
+- 第 2 次起隐式缓存命中 82%。缓存是否命中由上游决定，不保证每次命中。
 
 ### 5.5 排查
 
 | 现象 | 查看 |
 |---|---|
-| 客户端报 500 / 502 | Cloud Run 日志中的 `[GE Assist] HTTP xxx: ...`，即上游原始错误 |
-| 回答与系统指令不符 | 日志 `queryChars` 是否包含系统指令长度；检查客户端是否把系统指令放在 `system` 角色 |
-| 请求超时 | Cloud Run `--timeout` 和客户端超时是否大于上游耗时（建议 ≥ 900 秒） |
-| 冷启动慢 | 首次请求多出几秒，可设 `--min-instances 1` |
-
-```bash
-gcloud logging read 'resource.type="cloud_run_revision" AND resource.labels.service_name="aiclient2api-ge" AND severity>=ERROR' \
-  --project <PROJECT_ID> --limit 20 --format="value(textPayload)"
-```
+| 客户端报 4xx / 5xx | Cloud Run 日志中 `[GE Assist] HTTP xxx: ...`，即上游原始错误 |
+| 回答不遵守系统指令 | 日志里是否有 `model=… -> generateContent?model=…`；检查客户端是否用 `system` 角色 |
+| 思考 token 不为 0 | 模型名是否带 `-low`；日志 `thinkingLevel=` 字段 |
+| 冷启动慢 | `--min-instances 1` |
 
 ### 5.6 测试脚本 smoke_test.py
 
@@ -810,29 +641,19 @@ if __name__ == "__main__":
 ```python
 from openai import OpenAI
 client = OpenAI(base_url="<SERVICE_URL>/v1", api_key="<API_KEY>")
-
-# 流式
-for ch in client.chat.completions.create(
-        model="gemini-3.8-flash", stream=True,
-        messages=[{"role": "system", "content": "……"}, {"role": "user", "content": "你好"}]):
-    if ch.choices:
-        print(ch.choices[0].delta.content or "", end="")
-
-# JSON
-r = client.chat.completions.create(
-    model="gemini-3.8-flash",
-    messages=[{"role": "user", "content": "介绍 Cloud Spanner"}],
-    response_format={"type": "json_schema", "json_schema": {"name": "a", "schema": {
-        "type": "object", "properties": {"answer": {"type": "string"}}, "required": ["answer"]}}})
-print(r.choices[0].message.content)
+s = client.chat.completions.create(
+    model="gemini-3.8-flash-low", stream=True, stream_options={"include_usage": True},
+    messages=[{"role": "system", "content": "……"}, {"role": "user", "content": "你好"}])
+for ch in s:
+    if ch.choices: print(ch.choices[0].delta.content or "", end="")
+    if ch.usage: print("\n", ch.usage)
 ```
 
 ```bash
 # Claude 协议
-curl <SERVICE_URL>/v1/messages -H "x-api-key: <API_KEY>" -H "anthropic-version: 2023-06-01"   -H "Content-Type: application/json"   -d '{"model":"gemini-3.8-flash","max_tokens":1024,"messages":[{"role":"user","content":"你好"}]}'
-
+curl <SERVICE_URL>/v1/messages -H "x-api-key: <API_KEY>" -H "anthropic-version: 2023-06-01"   -H "Content-Type: application/json"   -d '{"model":"gemini-3.8-flash-low","max_tokens":1024,"messages":[{"role":"user","content":"你好"}]}'
 # Gemini 协议
-curl "<SERVICE_URL>/v1beta/models/gemini-3.8-flash:streamGenerateContent?alt=sse"   -H "x-goog-api-key: <API_KEY>" -H "Content-Type: application/json"   -d '{"contents":[{"role":"user","parts":[{"text":"你好"}]}]}'
+curl "<SERVICE_URL>/v1beta/models/gemini-3.8-flash-low:streamGenerateContent?alt=sse"   -H "x-goog-api-key: <API_KEY>" -H "Content-Type: application/json"   -d '{"contents":[{"role":"user","parts":[{"text":"你好"}]}]}'
 ```
 
 ## 7. 配置项
@@ -842,22 +663,16 @@ curl "<SERVICE_URL>/v1beta/models/gemini-3.8-flash:streamGenerateContent?alt=sse
 | `GE_PROJECT_ID` | 必填 | GE 所在项目 |
 | `GE_ENGINE_ID` | 必填 | GE 应用 ID |
 | `GE_LOCATION` | `global` | GE 应用所在位置 |
-| `GE_WEB_GROUNDING` | `false` | 是否允许助手联网搜索 |
 | `GE_CREDENTIALS_FILE` | 无 | 服务账号 key 路径；不填则用 ADC |
 | `GE_TIMEOUT_MS` | 600000 | 上游请求超时 |
 | `API_KEY`（Cloud Run） | 必填 | 客户端访问代理的密钥，由 Secret Manager 注入 |
 
 ## 8. 注意事项
 
-- **延迟**：streamAssist 会做规划和思考，长 prompt 首 token 实测 14~100 秒，思考无法关闭。
-- **没有 usage 和缓存**：OpenAI 协议的 `usage` 全为 0。
-- **JSON 模式不是真流式**：需要整段返回才能去掉代码块。
-- **会话记录**：每次请求在 GE 应用中新建一个会话，提示词和回答保存在运行身份的 GE 会话历史中。
-- **模型可用性**：
-  - 免费试用许可证下 gemini-4-argon 返回 400。
-  - 应用模型设置里没有启用的模型（例如 gemini-4-hydrogen、gemini-4-carbon）返回 400 `disabled by default`。
+- **未公开接口**：`assistants/default_assistant:generateContent` 不在 discovery 文档里，只在 v1alpha 可用，行为可能变化。上线前向 Google 确认支持情况、SLA 和计费方式。
+- **思考档位**：模型名不带后缀且客户端不指定时，模型默认会思考。业务调用建议用 `-low`。
 - **提示词落盘**：AIClient2API 会把每次收到的系统提示词覆盖写入 `configs/fetch_system_prompt.txt`，没有开关。Cloud Run 上写在内存文件系统里，会占用实例内存。
 - **公网暴露**：`--allow-unauthenticated` 时服务地址公网可达，只靠 API Key 保护。正式环境建议改用内网入口、IAP 或 API Gateway，并定期轮换 Key。
-- **许可合规**：用一个服务账号代表大量终端用户调用 GE 助手，是否符合 GE 许可条款需与 Google 确认。
+- **许可合规**：用一个服务账号代表大量终端用户调用 GE，是否符合 GE 许可条款需与 Google 确认。
 - **不要启用** AIClient2API 的多账号轮询、绕过限额等功能。
 - **维护**：AIClient2API 是 GPL-3.0 项目，补丁需要随上游版本自行维护。
